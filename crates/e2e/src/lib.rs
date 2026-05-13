@@ -175,7 +175,7 @@ pub fn start_daemon() -> DaemonHandle {
 
     let process = Command::new(&daemon_bin)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())  // Capture stderr for debugging
         .spawn()
         .expect("failed to start daemon");
 
@@ -193,7 +193,7 @@ pub fn start_daemon() -> DaemonHandle {
     DaemonHandle { process, socket_path, cli_bin }
 }
 
-fn find_bin(name: &str) -> String {
+pub fn find_bin(name: &str) -> String {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let path = dir.join(name);

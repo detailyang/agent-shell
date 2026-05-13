@@ -7,9 +7,9 @@ use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, Master
 use regex::Regex;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::io::{FromRawFd, OwnedFd};
+use std::os::unix::io::BorrowedFd;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 /// Default send/wait timeout in milliseconds.
 pub const DEFAULT_TIMEOUT_MS: u64 = 30000;
@@ -22,7 +22,7 @@ pub struct Session {
     pub name: Option<String>,
     pub pty_master: Box<dyn MasterPty + Send>,
     pub pty_reader: Box<dyn std::io::Read + Send>,
-    pub pty_writer: Box<dyn std::io::Write + Send>,
+    pub pty_writer: std::sync::Mutex<Box<dyn std::io::Write + Send>>,
     pub ringbuf: RingBuffer,
     pub vte_grid: VteGrid,
     pub shell_pgid: i32,
@@ -30,7 +30,8 @@ pub struct Session {
     pub prompt_regex: Option<Regex>,
     pub child_pid: u32,
     pub exited: Option<i32>,
-    pub created_at: Instant,
+    pub created_at: u64,  // Unix timestamp in seconds
+    pub created_at_instant: Instant,  // For elapsed time calculations
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub rows: u16,
@@ -110,17 +111,27 @@ impl Session {
         let child_killer = child.clone_killer();
 
         // Get the initial foreground process group
+        // Retry up to 500ms because the shell may not have set its pgid yet
         let master_fd = pair
             .master
             .as_raw_fd()
             .ok_or_else(|| "failed to get master fd".to_string())?;
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(master_fd) };
-        let shell_pgid = nix::unistd::tcgetpgrp(&owned_fd)
-            .map_err(|e| format!("tcgetpgrp failed: {}", e))?
-            .as_raw();
-
-        // Leak the fd back so it's not closed
-        std::mem::forget(owned_fd);
+        let mut shell_pgid: i32 = 0;
+        for _ in 0..10 {
+            // SAFETY: master_fd is a valid, owned fd inside pty_master.
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(master_fd) };
+            if let Ok(pgid) = nix::unistd::tcgetpgrp(&borrowed_fd) {
+                shell_pgid = pgid.as_raw();
+                if shell_pgid != 0 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if shell_pgid == 0 {
+            // Fallback: use the child's pid as the shell pgid
+            shell_pgid = child_pid as i32;
+        }
 
         // Get reader and writer handles
         let pty_reader = pair
@@ -148,7 +159,7 @@ impl Session {
             name,
             pty_master: pair.master,
             pty_reader,
-            pty_writer,
+            pty_writer: std::sync::Mutex::new(pty_writer),
             ringbuf: RingBuffer::new(buffer_size),
             vte_grid: VteGrid::new(rows, cols),
             shell_pgid,
@@ -157,7 +168,11 @@ impl Session {
             prompt_regex,
             child_pid,
             exited: None,
-            created_at: Instant::now(),
+            created_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            created_at_instant: Instant::now(),
             cwd,
             env: HashMap::new(),
             rows,
@@ -204,12 +219,14 @@ impl Session {
     /// Send text to the PTY (appends newline).
     pub fn send_text(&mut self, text: &str) -> Result<(), String> {
         let data = format!("{}\n", text);
-        self.pty_writer
+        let mut writer = self.pty_writer.lock().unwrap();
+        writer
             .write_all(data.as_bytes())
             .map_err(|e| format!("write failed: {}", e))?;
-        self.pty_writer
+        writer
             .flush()
             .map_err(|e| format!("flush failed: {}", e))?;
+        drop(writer);
         if let Some(ref mut rec) = self.recording {
             rec.record_in(data.as_bytes());
         }
@@ -224,12 +241,14 @@ impl Session {
             "z" => 0x1a,
             _ => return Err(format!("unknown control char: {}", ctrl)),
         };
-        self.pty_writer
+        let mut writer = self.pty_writer.lock().unwrap();
+        writer
             .write_all(&[byte])
             .map_err(|e| format!("write failed: {}", e))?;
-        self.pty_writer
+        writer
             .flush()
             .map_err(|e| format!("flush failed: {}", e))?;
+        drop(writer);
         if let Some(ref mut rec) = self.recording {
             rec.record_in(&[byte]);
         }
@@ -242,11 +261,12 @@ impl Session {
             Some(fd) => fd,
             None => return self.current_fg_pgid,
         };
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(master_fd) };
-        let result = nix::unistd::tcgetpgrp(&owned_fd)
+        // SAFETY: master_fd is a valid, owned fd inside pty_master.
+        // We borrow it for tcgetpgrp without taking ownership.
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(master_fd) };
+        let result = nix::unistd::tcgetpgrp(&borrowed_fd)
             .map(|p| p.as_raw())
             .unwrap_or(self.current_fg_pgid);
-        std::mem::forget(owned_fd);
 
         self.prev_fg_pgid = self.current_fg_pgid;
         self.current_fg_pgid = result;

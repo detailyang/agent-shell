@@ -464,7 +464,7 @@ mod kill_daemon {
         // Create a session to prove daemon works
         let resp = daemon.cli_json(&["create", "--name", "before_kill"]);
         assert_ok(&resp);
-        let sid1 = session_id(&resp);
+        let _sid1 = session_id(&resp);
 
         // Kill daemon
         let _ = daemon.cli(&["kill-daemon"]);
@@ -495,5 +495,65 @@ mod kill_daemon {
             .args(&["destroy", "--session", &sid2])
             .output();
         let _ = std::process::Command::new(&cli_bin).args(&["kill-daemon"]).output();
+    }
+}
+
+mod sigterm {
+    use std::os::unix::process::CommandExt;
+
+    /// SIGTERM should trigger graceful shutdown: kill sessions, clean up socket & pid files.
+    #[test]
+    fn sigterm_graceful_shutdown() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let base = std::path::PathBuf::from(&home).join(".agent-shell");
+        let socket_path = base.join("daemon.sock");
+        let pid_path = base.join("daemon.pid");
+
+        // Clean up any existing daemon
+        let _ = std::fs::remove_file(&socket_path);
+        if let Ok(p) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = p.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL); }
+            }
+        }
+        let _ = std::fs::remove_file(&pid_path);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Start daemon in its own process group so cargo test doesn't interfere
+        let daemon_bin = agent_shell_e2e::find_bin("agent-shell-daemon");
+        let mut daemon = std::process::Command::new(&daemon_bin)
+            .process_group(0)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn daemon");
+
+        // Wait for socket
+        for _ in 0..30 {
+            if socket_path.exists() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(socket_path.exists(), "daemon socket should appear");
+
+        // Send SIGTERM
+        let pid_from_file: i32 = std::fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
+        unsafe { libc::kill(pid_from_file, libc::SIGTERM); }
+
+        // Wait for the daemon to exit (up to 5s)
+        for _ in 0..50 {
+            match daemon.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
+
+        // Give time for file cleanup after process exit
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        assert!(!socket_path.exists(), "socket should be removed after SIGTERM");
+        assert!(!pid_path.exists(), "pid file should be removed after SIGTERM");
+
+        let _ = daemon.kill();
+        let _ = daemon.wait();
     }
 }

@@ -43,21 +43,30 @@ impl RingBuffer {
             return 0;
         }
 
+        let data_len = data.len();
+        let cap = self.capacity;
+
+        // Fast path: buffer hasn't wrapped yet and can absorb all data
+        if self.write_cursor < cap as u64 && (self.write_cursor as usize + data_len) <= cap {
+            let start = self.write_cursor as usize;
+            self.buf[start..start + data_len].copy_from_slice(data);
+            self.write_cursor += data_len as u64;
+            return 0;
+        }
+
+        // Slow path: may wrap or overwrite — fall back to byte-by-byte for correctness
+        // (the ring buffer's `start` tracking requires per-byte overwrite detection)
         let mut lost = 0u64;
 
         for &byte in data {
-            if self.write_cursor >= self.capacity as u64 {
-                // Buffer has wrapped at least once
-                let write_idx = (self.write_cursor % self.capacity as u64) as usize;
-                // If start == write_idx, we're about to overwrite data that
-                // hasn't been "lost" yet from the logical perspective
+            if self.write_cursor >= cap as u64 {
+                let write_idx = (self.write_cursor % cap as u64) as usize;
                 if write_idx == self.start && self.write_cursor > 0 {
-                    self.start = (self.start + 1) % self.capacity;
+                    self.start = (self.start + 1) % cap;
                     lost += 1;
                 }
                 self.buf[write_idx] = byte;
             } else {
-                // Still filling initially
                 let write_idx = self.write_cursor as usize;
                 self.buf[write_idx] = byte;
             }
@@ -102,12 +111,23 @@ impl RingBuffer {
             return Vec::new();
         }
         let len = (end - start) as usize;
+        let cap = self.capacity as u64;
         let mut result = Vec::with_capacity(len);
-        for i in 0..len {
-            let pos = start + i as u64;
-            let idx = (pos % self.capacity as u64) as usize;
-            result.push(self.buf[idx]);
+
+        // Check if the range is contiguous (no wrap)
+        let start_idx = (start % cap) as usize;
+        let _end_idx = (end % cap) as usize;
+
+        if start_idx + len <= self.capacity {
+            // Contiguous: single slice copy
+            result.extend_from_slice(&self.buf[start_idx..start_idx + len]);
+        } else {
+            // Wraps around: two slice copies
+            let first_chunk = self.capacity - start_idx;
+            result.extend_from_slice(&self.buf[start_idx..]);
+            result.extend_from_slice(&self.buf[..len - first_chunk]);
         }
+
         result
     }
 

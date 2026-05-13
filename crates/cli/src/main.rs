@@ -2,7 +2,6 @@ use agent_shell_core::config::Config;
 use agent_shell_core::protocol::{Request, Response};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
-use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -154,7 +153,8 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    println!("{{\"ok\":false,\"error\":\"{}\"}}", e.replace('"', "\\\""));
+                    let err_json = serde_json::to_string(&e).unwrap_or_else(|_| "unknown error".to_string());
+                    println!("{{\"ok\":false,\"error\":{}}}", err_json);
                     std::process::exit(1);
                 }
             }
@@ -274,13 +274,14 @@ struct RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let stdin_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(0) };
+        // SAFETY: fd 0 is stdin, always valid while process is alive.
+        // BorrowedFd does not close on drop.
+        let stdin_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) };
         let _ = nix::sys::termios::tcsetattr(
             &stdin_fd,
             nix::sys::termios::SetArg::TCSADRAIN,
             &self.original,
         );
-        std::mem::forget(stdin_fd); // don't close fd 0
     }
 }
 
@@ -288,13 +289,13 @@ fn enter_raw_mode() -> Option<RawModeGuard> {
     if !std::io::stdin().is_terminal() {
         return None;
     }
-    // Borrow fd 0 without closing it
-    let stdin_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(0) };
+    // SAFETY: fd 0 is stdin, always valid while process is alive.
+    // BorrowedFd does not close on drop.
+    let stdin_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) };
     let original = nix::sys::termios::tcgetattr(&stdin_fd).ok()?;
     let mut raw = original.clone();
     nix::sys::termios::cfmakeraw(&mut raw);
     nix::sys::termios::tcsetattr(&stdin_fd, nix::sys::termios::SetArg::TCSANOW, &raw).ok()?;
-    std::mem::forget(stdin_fd);
     Some(RawModeGuard { original })
 }
 

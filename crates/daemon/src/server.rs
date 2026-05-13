@@ -6,7 +6,7 @@ use nix::libc;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 /// Per-client read cursor state.
 #[derive(Debug)]
@@ -21,7 +21,11 @@ struct AppState {
     clients: HashMap<String, ClientState>,
 }
 
-pub async fn run(socket_path: std::path::PathBuf, config: Config) -> Result<(), String> {
+pub async fn run(
+    socket_path: std::path::PathBuf,
+    config: Config,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
     // Clean up stale socket
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
@@ -80,13 +84,38 @@ pub async fn run(socket_path: std::path::PathBuf, config: Config) -> Result<(), 
         }
     });
 
-    // Accept connections
+    // Accept connections (or shutdown)
     loop {
-        let (stream, _) = listener.accept().await.map_err(|e| format!("accept: {}", e))?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            handle_connection(stream, state).await;
-        });
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result.map_err(|e| format!("accept: {}", e))?;
+                let state = state.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, state).await;
+                });
+            }
+            _ = shutdown_rx.changed() => {
+                // Graceful shutdown requested (SIGTERM/SIGINT)
+                eprintln!("agent-shell daemon: shutdown requested");
+                // Kill all sessions
+                {
+                    let mut s = state.lock().await;
+                    for session in s.sessions.values_mut() {
+                        session.kill();
+                        session.close_recording();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                {
+                    let mut s = state.lock().await;
+                    for session in s.sessions.values_mut() {
+                        session.force_kill();
+                    }
+                    s.sessions.clear();
+                }
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -258,21 +287,34 @@ fn set_nonblocking(fd: Option<std::os::unix::io::RawFd>) {
 }
 
 async fn handle_destroy(state: Arc<Mutex<AppState>>, session_id: String) -> Response {
+    // Step 1: kill + close recording under lock
+    {
+        let mut s = state.lock().await;
+        match s.sessions.get_mut(&session_id) {
+            Some(session) => {
+                session.kill();
+                session.close_recording();
+            }
+            None => return Response::err("session not found"),
+        }
+    }
+
+    // Step 2: sleep WITHOUT lock to let SIGHUP take effect
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Step 3: force kill + reap + remove under lock
     let mut s = state.lock().await;
     match s.sessions.get_mut(&session_id) {
         Some(session) => {
-            session.kill();
-            session.close_recording();
-            std::thread::sleep(std::time::Duration::from_millis(50));
             session.force_kill(); // SIGKILL + reap
-            s.sessions.remove(&session_id); // Drop triggers Session::drop -> try_wait
-            Response {
-                ok: true,
-                session_id: Some(session_id),
-                ..Response::ok()
-            }
         }
-        None => Response::err("session not found"),
+        None => return Response::err("session not found"),
+    }
+    s.sessions.remove(&session_id); // Drop triggers Session::drop -> try_wait
+    Response {
+        ok: true,
+        session_id: Some(session_id),
+        ..Response::ok()
     }
 }
 
@@ -317,6 +359,15 @@ async fn handle_send(
             if let Err(e) = session.send_text(&text) {
                 return Response::err(e);
             }
+        } else {
+            // No text and no ctrl — nothing to send, return immediately
+            return Response {
+                ok: true,
+                seq: Some(seq),
+                output: Some(String::new()),
+                elapsed_ms: Some(0),
+                ..Response::ok()
+            };
         }
 
         // Drain any immediate output
@@ -327,7 +378,10 @@ async fn handle_send(
     // Step 2: If nowait or ctrl, return immediately
     if nowait || ctrl.is_some() {
         let mut s = state.lock().await;
-        let session = s.sessions.get_mut(&session_id).unwrap();
+        let session = match s.sessions.get_mut(&session_id) {
+            Some(s) => s,
+            None => return Response::err("session not found"),
+        };
         session.feed();
 
         let (output, gap, lost_bytes) = session.ringbuf.read(write_cursor_before);
@@ -370,7 +424,10 @@ async fn handle_send(
     loop {
         if std::time::Instant::now() >= deadline {
             let mut s = state.lock().await;
-            let session = s.sessions.get_mut(&session_id).unwrap();
+            let session = match s.sessions.get_mut(&session_id) {
+                Some(s) => s,
+                None => return Response::err("session not found"),
+            };
             session.feed();
 
             let (output, gap, lost_bytes) = session.ringbuf.read(write_cursor_before);
@@ -458,7 +515,10 @@ async fn handle_send(
             || (fg_at_shell && has_new_output && elapsed.as_millis() >= 200)
         {
             let mut s = state.lock().await;
-            let session = s.sessions.get_mut(&session_id).unwrap();
+            let session = match s.sessions.get_mut(&session_id) {
+                Some(s) => s,
+                None => return Response::err("session not found"),
+            };
             let (output, gap, lost_bytes) = session.ringbuf.read(write_cursor_before);
             if let Some(ref cid) = client_id {
                 let wc = session.ringbuf.write_cursor();
@@ -501,27 +561,29 @@ fn read_from_cursor(
     session_id: &str,
     client_id: &Option<String>,
 ) -> (Vec<u8>, bool, u64) {
-    let client_id_val = client_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    let cursor = state.clients.get(&client_id_val).map(|c| c.read_cursor).unwrap_or(0);
-
     let session = match state.sessions.get(session_id) {
         Some(s) => s,
         None => return (Vec::new(), false, 0),
     };
 
-    let (data, gap, lost) = session.ringbuf.read(cursor);
-    let new_cursor = session.ringbuf.write_cursor();
-
-    state.clients.insert(
-        client_id_val,
-        ClientState {
-            read_cursor: new_cursor,
-            last_active: std::time::Instant::now(),
-        },
-    );
-
-    (data, gap, lost)
+    // Only track client cursor if a client_id is provided
+    if let Some(ref cid) = client_id {
+        let cursor = state.clients.get(cid).map(|c| c.read_cursor).unwrap_or(0);
+        let (data, gap, lost) = session.ringbuf.read(cursor);
+        let new_cursor = session.ringbuf.write_cursor();
+        state.clients.insert(
+            cid.clone(),
+            ClientState {
+                read_cursor: new_cursor,
+                last_active: std::time::Instant::now(),
+            },
+        );
+        (data, gap, lost)
+    } else {
+        // No client_id: read all output from cursor 0 (full buffer)
+        let (data, gap, lost) = session.ringbuf.read(0);
+        (data, gap, lost)
+    }
 }
 
 async fn handle_read(
@@ -537,6 +599,7 @@ async fn handle_read(
             Some(s) => s,
             None => return Response::err("session not found"),
         };
+        session.feed(); // Drain PTY output first so VTE grid is up-to-date
         let screen_data = session.vte_grid.screen();
         let cursor = session.vte_grid.cursor();
         return Response {
@@ -554,6 +617,14 @@ async fn handle_read(
 
     if let Some(exit_code) = session.exited {
         let (output, gap, lost_bytes) = read_from_cursor(&mut s, &session_id, &client_id);
+        if output.is_empty() {
+            return Response {
+                ok: false,
+                error: Some("session exited".into()),
+                exit_code: Some(exit_code),
+                ..Response::ok()
+            };
+        }
         let mut resp = Response {
             ok: true,
             output: Some(String::from_utf8_lossy(&output).to_string()),
@@ -564,10 +635,6 @@ async fn handle_read(
         if gap {
             resp.gap = Some(true);
             resp.lost_bytes = Some(lost_bytes);
-        }
-        if output.is_empty() {
-            resp.ok = false;
-            resp.error = Some("session exited".into());
         }
         return resp;
     }
@@ -745,7 +812,7 @@ async fn handle_list(state: Arc<Mutex<AppState>>) -> Response {
             exited: session.exited.is_some(),
             exit_code: session.exited,
             pid: session.child_pid,
-            created_at: session.created_at.elapsed().as_secs(),
+            created_at: session.created_at,
             buffer_size: session.buffer_size,
             recording: session.recording.is_some(),
         })
@@ -781,16 +848,26 @@ async fn handle_resize(
 }
 
 async fn handle_stop(state: Arc<Mutex<AppState>>) -> Response {
-    let mut s = state.lock().await;
-    for session in s.sessions.values_mut() {
-        session.kill();
-        session.close_recording();
+    // Step 1: kill all sessions under lock
+    {
+        let mut s = state.lock().await;
+        for session in s.sessions.values_mut() {
+            session.kill();
+            session.close_recording();
+        }
     }
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    for session in s.sessions.values_mut() {
-        session.force_kill(); // SIGKILL + reap
+
+    // Step 2: sleep WITHOUT lock to let SIGHUP take effect
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Step 3: force kill + reap + remove all under lock
+    {
+        let mut s = state.lock().await;
+        for session in s.sessions.values_mut() {
+            session.force_kill(); // SIGKILL + reap
+        }
+        s.sessions.clear(); // Drop all sessions -> Session::drop -> try_wait
     }
-    s.sessions.clear(); // Drop all sessions -> Session::drop -> try_wait
 
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -807,7 +884,7 @@ async fn handle_attach(
     readonly: bool,
 ) {
     // ── Phase 1: validate & send initial JSON handshake ──────────────────
-    let (redraw_bytes, start_cursor) = {
+    let (redraw_bytes, start_cursor, pty_fd) = {
         let mut s = state.lock().await;
         let session = match s.sessions.get_mut(&session_id) {
             Some(s) => s,
@@ -822,11 +899,11 @@ async fn handle_attach(
         }
         let wc = session.ringbuf.write_cursor();
         let redraw = session.vte_grid.full_redraw_bytes();
-        (redraw, wc)
+        let fd = session.master_fd();
+        (redraw, wc, fd)
     };
 
     // JSON response carries the VT100 full-screen redraw.
-    // serde_json will correctly round-trip the control chars.
     let init_resp = Response {
         ok: true,
         output: Some(String::from_utf8_lossy(&redraw_bytes).to_string()),
@@ -835,9 +912,22 @@ async fn handle_attach(
     send_response(&mut stream, &init_resp).await;
 
     // ── Phase 2: raw binary bidirectional streaming ─────────────────────
-    // After the length-prefixed JSON, we switch to raw binary:
-    //   client → daemon: raw keystroke bytes
-    //   daemon → client: raw PTY output bytes
+    // Use AsyncFd for event-driven PTY reads (no polling latency).
+    // AsyncFd registers the PTY master fd with tokio's epoll/kqueue.
+    struct BorrowedFd(std::os::unix::io::RawFd);
+    impl std::os::unix::io::AsRawFd for BorrowedFd {
+        fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0 }
+    }
+    // BorrowedFd does NOT close the fd on drop — the Session owns it.
+    impl Drop for BorrowedFd {
+        fn drop(&mut self) {}
+    }
+
+    let async_fd = match pty_fd {
+        Some(fd) => tokio::io::unix::AsyncFd::new(BorrowedFd(fd)).ok(),
+        None => None,
+    };
+
     let (mut stream_rx, mut stream_tx) = stream.into_split();
     let mut pty_cursor = start_cursor;
     let mut running = true;
@@ -846,38 +936,82 @@ async fn handle_attach(
         let mut stdin_buf = [0u8; 4096];
 
         if readonly {
-            // ── readonly: only poll PTY ──
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        } else {
-            // ── rw: select between client-stdin and PTY-poll ──
-            tokio::select! {
-                // client keystroke → PTY
-                result = stream_rx.read(&mut stdin_buf) => {
-                    match result {
-                        Ok(0) => { running = false; continue; }
-                        Ok(n) => {
-                            let data = &stdin_buf[..n];
-                            let mut s = state.lock().await;
-                            if let Some(session) = s.sessions.get_mut(&session_id) {
-                                let _ = session.pty_writer.write_all(data);
-                                let _ = session.pty_writer.flush();
-                                if let Some(ref mut rec) = session.recording {
-                                    rec.record_in(data);
-                                }
-                            } else {
-                                running = false;
-                            }
-                        }
-                        Err(_) => { running = false; continue; }
+            // ── readonly: wait for PTY data via AsyncFd ──
+            if let Some(ref async_fd) = async_fd {
+                match async_fd.readable().await {
+                    Ok(mut guard) => {
+                        // Clear readiness before reading to avoid spurious wakeups
+                        guard.clear_ready();
                     }
-                    // Also drain any PTY output that the keystroke may have produced
+                    Err(_) => { running = false; continue; }
                 }
-                // PTY poll timer
-                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        } else {
+            // ── rw: select between client-stdin and PTY-readiness ──
+            if let Some(ref async_fd) = async_fd {
+                tokio::select! {
+                    // client keystroke → PTY
+                    result = stream_rx.read(&mut stdin_buf) => {
+                        match result {
+                            Ok(0) => { running = false; continue; }
+                            Ok(n) => {
+                                let data = &stdin_buf[..n];
+                                let mut s = state.lock().await;
+                                if let Some(session) = s.sessions.get_mut(&session_id) {
+                                    if let Some(ref mut writer) = session.pty_writer.lock().ok() {
+                                        let _ = writer.write_all(data);
+                                        let _ = writer.flush();
+                                    }
+                                    if let Some(ref mut rec) = session.recording {
+                                        rec.record_in(data);
+                                    }
+                                } else {
+                                    running = false;
+                                }
+                            }
+                            Err(_) => { running = false; continue; }
+                        }
+                    }
+                    // PTY fd became readable
+                    result = async_fd.readable() => {
+                        match result {
+                            Ok(mut guard) => { guard.clear_ready(); }
+                            Err(_) => { running = false; continue; }
+                        }
+                    }
+                }
+            } else {
+                // Fallback: no raw fd available, poll at 5ms
+                tokio::select! {
+                    result = stream_rx.read(&mut stdin_buf) => {
+                        match result {
+                            Ok(0) => { running = false; continue; }
+                            Ok(n) => {
+                                let data = &stdin_buf[..n];
+                                let mut s = state.lock().await;
+                                if let Some(session) = s.sessions.get_mut(&session_id) {
+                                    if let Some(ref mut writer) = session.pty_writer.lock().ok() {
+                                        let _ = writer.write_all(data);
+                                        let _ = writer.flush();
+                                    }
+                                    if let Some(ref mut rec) = session.recording {
+                                        rec.record_in(data);
+                                    }
+                                } else {
+                                    running = false;
+                                }
+                            }
+                            Err(_) => { running = false; continue; }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
             }
         }
 
-        // ── poll PTY output → client ──
+        // ── drain PTY output → client ──
         let (data, exited, gone) = {
             let mut s = state.lock().await;
             match s.sessions.get_mut(&session_id) {
