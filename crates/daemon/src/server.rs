@@ -884,7 +884,10 @@ async fn handle_attach(
     readonly: bool,
 ) {
     // ── Phase 1: validate & send initial JSON handshake ──────────────────
-    let (redraw_bytes, start_cursor, pty_fd) = {
+    // Instead of using VteGrid full_redraw (which strips colors/attributes),
+    // we transmit the raw PTY output bytes from the ring buffer.
+    // The client's real terminal will interpret the escape sequences correctly.
+    let (raw_output, start_cursor, pty_fd) = {
         let mut s = state.lock().await;
         let session = match s.sessions.get_mut(&session_id) {
             Some(s) => s,
@@ -897,16 +900,24 @@ async fn handle_attach(
             send_response(&mut stream, &Response::err("session exited")).await;
             return;
         }
+        session.feed();
         let wc = session.ringbuf.write_cursor();
-        let redraw = session.vte_grid.full_redraw_bytes();
+        // Read all available raw PTY output from the ringbuf
+        // (this includes VT100 escape sequences for colors, cursor movement, etc.)
+        let (raw_bytes, _gap, _lost) = session.ringbuf.read(0);
         let fd = session.master_fd();
-        (redraw, wc, fd)
+        (raw_bytes, wc, fd)
     };
 
-    // JSON response carries the VT100 full-screen redraw.
+    // JSON response carries the raw PTY output.
+    // We use base64 encoding to safely transport binary data through JSON
+    // without corrupting escape sequences via lossy UTF-8 conversion.
     let init_resp = Response {
         ok: true,
-        output: Some(String::from_utf8_lossy(&redraw_bytes).to_string()),
+        output: Some(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &raw_output,
+        )),
         ..Response::ok()
     };
     send_response(&mut stream, &init_resp).await;

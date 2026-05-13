@@ -62,6 +62,8 @@ impl Drop for DaemonHandle {
 /// Raw attach connection for testing bidirectional streaming.
 pub struct AttachConnection {
     stream: std::os::unix::net::UnixStream,
+    /// Raw PTY bytes from the initial handshake (base64-decoded).
+    pub initial_output: Vec<u8>,
 }
 
 impl AttachConnection {
@@ -97,7 +99,15 @@ impl AttachConnection {
             return Err(resp.error.unwrap_or_else(|| "attach failed".into()));
         }
 
-        Ok(AttachConnection { stream })
+        // Decode the base64-encoded initial output
+        let initial_output = resp.output
+            .as_ref()
+            .and_then(|s| base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD, s
+            ).ok())
+            .unwrap_or_default();
+
+        Ok(AttachConnection { stream, initial_output })
     }
 
     /// Send raw bytes to the PTY.

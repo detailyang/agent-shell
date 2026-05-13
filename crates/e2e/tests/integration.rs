@@ -557,3 +557,408 @@ mod sigterm {
         let _ = daemon.wait();
     }
 }
+
+mod render {
+    use super::*;
+
+    /// Helper: create a session, send a printf command, then attach and read raw bytes.
+    fn attach_after_send(
+        daemon: &mut DaemonHandle,
+        sid: &str,
+        printf_cmd: &str,
+    ) -> Vec<u8> {
+        let resp = daemon.cli_json(&[
+            "send", "--session", sid, "--timeout", "5000", printf_cmd,
+        ]);
+        assert_ok(&resp);
+
+        let mut conn = daemon.connect_attach_rw(sid).expect("attach connect");
+        let mut all_bytes = conn.initial_output.clone();
+        let stream_bytes = conn.read_output(std::time::Duration::from_millis(500));
+        all_bytes.extend_from_slice(&stream_bytes);
+        all_bytes
+    }
+
+    /// Verify that a specific byte sequence appears in the attach output.
+    fn assert_contains_escape(bytes: &[u8], needle: &[u8], label: &str) {
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle),
+            "{}: expected byte sequence {:?} in attach output, not found.\n\
+             Output hex: {}\n\
+             Output text: {:?}",
+            label, needle,
+            hex_dump(bytes),
+            String::from_utf8_lossy(bytes),
+        );
+    }
+
+    /// Verify that a specific text string appears in the attach output.
+    fn assert_contains_text(bytes: &[u8], text: &str, label: &str) {
+        let output = String::from_utf8_lossy(bytes);
+        assert!(
+            output.contains(text),
+            "{}: expected text '{}' in attach output, not found.\nOutput: {:?}",
+            label, text, &output[..output.len().min(1000)],
+        );
+    }
+
+    fn hex_dump(data: &[u8]) -> String {
+        data.iter().take(200).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+    }
+
+    // ── SGR (Select Graphic Rendition) color sequences ────────────────
+
+    /// Red foreground: ESC[31m ... ESC[0m
+    #[test]
+    fn sgr_red_foreground() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "sgr_red"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[31mRED\033[0m'"#
+        );
+
+        // ESC[31m = 0x1b 0x5b 0x33 0x31 0x6d
+        assert_contains_escape(&bytes, b"\x1b[31m", "SGR red fg");
+        assert_contains_escape(&bytes, b"\x1b[0m", "SGR reset");
+        assert_contains_text(&bytes, "RED", "red text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Green background: ESC[42m ... ESC[0m
+    #[test]
+    fn sgr_green_background() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "sgr_bg"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[42mBG_GREEN\033[0m'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[42m", "SGR green bg");
+        assert_contains_escape(&bytes, b"\x1b[0m", "SGR reset");
+        assert_contains_text(&bytes, "BG_GREEN", "green bg text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Bold: ESC[1m ... ESC[0m
+    #[test]
+    fn sgr_bold() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "sgr_bold"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[1mBOLD\033[0m'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[1m", "SGR bold");
+        assert_contains_escape(&bytes, b"\x1b[0m", "SGR reset");
+        assert_contains_text(&bytes, "BOLD", "bold text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Combined SGR: bold + red fg + green bg
+    #[test]
+    fn sgr_combined() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "sgr_combo"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[1;31;42mCOMBO\033[0m'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[1;31;42m", "SGR combined");
+        assert_contains_text(&bytes, "COMBO", "combined text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    // ── Cursor movement sequences ────────────────────────────────────
+
+    /// Cursor position: ESC[H (home) and ESC[row;colH (absolute)
+    #[test]
+    fn cursor_position() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "cur_pos"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf 'ABC\033[2;1HXYZ'"#
+        );
+
+        assert_contains_text(&bytes, "ABC", "text before move");
+        assert_contains_escape(&bytes, b"\x1b[2;1H", "cursor absolute position");
+        assert_contains_text(&bytes, "XYZ", "text after move");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Cursor up/down/left/right
+    #[test]
+    fn cursor_directional() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "cur_dir"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            // Move right 3, write X, move left 5, write Y
+            r#"printf '\033[3C X\033[5D Y'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[3C", "cursor right");
+        assert_contains_escape(&bytes, b"\x1b[5D", "cursor left");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Save/restore cursor: ESC[s / ESC[u
+    #[test]
+    fn cursor_save_restore() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "cur_save"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[sSAVED\033[uRESTORED'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[s", "cursor save");
+        assert_contains_escape(&bytes, b"\x1b[u", "cursor restore");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    // ── Erase / clear sequences ─────────────────────────────────────
+
+    /// Clear line: ESC[K
+    #[test]
+    fn erase_line() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "erase_line"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf 'WILL_ERASE\033[K'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[K", "erase to end of line");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Clear screen: ESC[2J + cursor home ESC[H
+    #[test]
+    fn clear_screen() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "clear_scr"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[2J\033[HCLEARED'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[2J", "clear screen");
+        assert_contains_escape(&bytes, b"\x1b[H", "cursor home");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    // ── 256-color and RGB sequences ─────────────────────────────────
+
+    /// 256-color: ESC[38;5;196m (red in 256-color palette)
+    #[test]
+    fn sgr_256_color() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "sgr_256"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[38;5;196mCOLOR256\033[0m'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[38;5;196m", "256-color fg");
+        assert_contains_text(&bytes, "COLOR256", "256-color text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// True-color (RGB): ESC[38;2;255;0;0m
+    #[test]
+    fn sgr_rgb_color() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "sgr_rgb"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[38;2;255;0;0mRGB_RED\033[0m'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[38;2;255;0;0m", "RGB fg");
+        assert_contains_text(&bytes, "RGB_RED", "RGB text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    // ── OSC (Operating System Command) sequences ───────────────────
+
+    /// Window title: ESC]0;title BEL
+    #[test]
+    fn osc_window_title() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "osc_title"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033]0;MY_TITLE\007'"#
+        );
+
+        // ESC ] = 0x1b 0x5d
+        assert_contains_escape(&bytes, b"\x1b]0;MY_TITLE", "OSC title");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    // ── Alternate screen buffer ─────────────────────────────────────
+
+    /// Switch to alternate screen: ESC[?1049h and back: ESC[?1049l
+    #[test]
+    fn alternate_screen() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "alt_screen"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[?1049hALT_SCREEN\033[?1049l'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[?1049h", "alt screen on");
+        assert_contains_escape(&bytes, b"\x1b[?1049l", "alt screen off");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    // ── Scroll region ───────────────────────────────────────────────
+
+    /// Set scroll region: ESC[1;10r
+    #[test]
+    fn scroll_region() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "scroll_reg"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let bytes = attach_after_send(&mut daemon, &sid,
+            r#"printf '\033[1;10rSCROLL_REGION\033[r'"#
+        );
+
+        assert_contains_escape(&bytes, b"\x1b[1;10r", "set scroll region");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    // ── Live attach: escape sequences in real-time ──────────────────
+
+    /// Attach, then send a command that produces colors, verify live stream.
+    #[test]
+    fn attach_live_colored_output() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "live_color"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Attach first
+        let mut conn = daemon.connect_attach_rw(&sid).expect("attach connect");
+        let _ = conn.read_output(std::time::Duration::from_millis(300));
+
+        // Use echo -e to interpret escape sequences
+        conn.send(b"echo -e '\\033[32mGREEN\\033[0m'\n").unwrap();
+
+        // Read the output — should contain the escape sequence
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut all_output = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let chunk = conn.read_output(std::time::Duration::from_millis(200));
+            all_output.extend_from_slice(&chunk);
+            if all_output.windows(b"\x1b[32m".len()).any(|w| w == b"\x1b[32m") {
+                break;
+            }
+        }
+
+        assert_contains_escape(&all_output, b"\x1b[32m", "live green fg");
+        assert_contains_text(&all_output, "GREEN", "live green text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Attach then produce complex multi-line colored output via CLI send.
+    #[test]
+    fn attach_sees_cli_colored_output() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "cli_color"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Attach first
+        let mut conn = daemon.connect_attach_rw(&sid).expect("attach connect");
+        let _ = conn.read_output(std::time::Duration::from_millis(300));
+
+        // Send a colored command via CLI (not through the attach)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf '\033[1;33mBOLD_YELLOW\033[0m\n'"#,
+        ]);
+        assert_ok(&resp);
+
+        // Attach should see the colored output in its stream
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut all_output = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let chunk = conn.read_output(std::time::Duration::from_millis(200));
+            all_output.extend_from_slice(&chunk);
+            if all_output.windows(b"\x1b[1;33m".len()).any(|w| w == b"\x1b[1;33m") {
+                break;
+            }
+        }
+
+        assert_contains_escape(&all_output, b"\x1b[1;33m", "CLI bold yellow");
+        assert_contains_text(&all_output, "BOLD_YELLOW", "CLI bold yellow text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+}

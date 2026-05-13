@@ -1,7 +1,12 @@
 use vte::{Params, Perform};
 
 /// VTE terminal grid wrapper. Parses VT100 escape sequences and maintains
-/// a screen character matrix for `attach` screen redraw and `read --screen`.
+/// a screen character matrix for `read --screen`.
+///
+/// NOTE: This grid tracks character positions only — it does NOT preserve
+/// SGR attributes (colors, bold, underline, etc.). It is NOT used for
+/// `attach` screen redraw. Attach transmits raw PTY bytes directly so the
+/// client's real terminal handles all rendering, including colors.
 pub struct VteGrid {
     rows: usize,
     cols: usize,

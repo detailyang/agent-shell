@@ -337,10 +337,20 @@ async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
         return Err(resp.error.unwrap_or_else(|| "attach failed".into()));
     }
 
-    // Print the initial screen (VT100 full redraw)
+    // Decode the base64-encoded raw PTY output and write to terminal.
+    // This preserves all escape sequences (colors, cursor movement, etc.).
     if let Some(output) = &resp.output {
-        let _ = std::io::stdout().write_all(output.as_bytes());
-        let _ = std::io::stdout().flush();
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, output) {
+            Ok(bytes) => {
+                let _ = std::io::stdout().write_all(&bytes);
+                let _ = std::io::stdout().flush();
+            }
+            Err(_) => {
+                // Fallback: treat as plain text (for backwards compat)
+                let _ = std::io::stdout().write_all(output.as_bytes());
+                let _ = std::io::stdout().flush();
+            }
+        }
     }
 
     // ── Phase 2: raw binary bidirectional streaming ────────────────
