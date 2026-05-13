@@ -1,0 +1,21 @@
+[package]
+name = "agent-shell-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+portable-pty = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+uuid = { workspace = true }
+nix = { workspace = true }
+vte = { workspace = true }
+toml = { workspace = true }
+base64 = { workspace = true }
+shellexpand = "2"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
