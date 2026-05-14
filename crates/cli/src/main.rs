@@ -332,15 +332,6 @@ async fn pick_session(socket_path: &PathBuf) -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    // If only one session, auto-select it
-    // REMOVED: always show the picker so user has control
-    // if active.len() == 1 {
-    //     let s = &active[0];
-    //     let label = session_label(s);
-    //     eprintln!("Only one session, auto-selecting: {}", label);
-    //     return Ok(Some(s.id.clone()));
-    // }
-
     // Interactive picker — requires a terminal
     if !std::io::stdin().is_terminal() {
         eprintln!("{} session(s) available but stdin is not a terminal.", active.len());
@@ -352,136 +343,26 @@ async fn pick_session(socket_path: &PathBuf) -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    // Enter raw mode for interactive selection
-    let raw_guard = enter_raw_mode().ok_or("failed to enter raw mode")?;
-    let result = run_picker(&active);
-    drop(raw_guard); // restore terminal before any further output
+    // Build selection items
+    let items: Vec<String> = active.iter().map(|s| session_label(s)).collect();
 
-    result
+    let selection = dialoguer::Select::new()
+        .with_prompt("Select session")
+        .items(&items)
+        .default(0)
+        .interact_opt()
+        .map_err(|e| format!("picker: {}", e))?;
+
+    match selection {
+        Some(idx) => Ok(Some(active[idx].id.clone())),
+        None => Ok(None), // user cancelled
+    }
 }
 
 /// Format a session label for display.
 fn session_label(s: &agent_shell_core::protocol::SessionInfo) -> String {
     let name = s.name.as_deref().unwrap_or("<unnamed>");
     format!("{} ({}, pid {})", s.id, name, s.pid)
-}
-
-/// Run the interactive picker. Terminal must already be in raw mode.
-/// Returns Ok(Some(session_id)) on selection, Ok(None) on cancel.
-fn run_picker(sessions: &[agent_shell_core::protocol::SessionInfo]) -> Result<Option<String>, String> {
-    let mut selected = 0usize;
-    let count = sessions.len();
-    let stdout = std::io::stdout();
-    let mut stdout_lock = stdout.lock();
-    let mut first_draw = true;
-
-    // Main event loop — read raw keypresses
-    let stdin_fd = 0i32; // stdin
-    let mut buf = [0u8; 16];
-    loop {
-        // Draw current state
-        draw_picker(&mut stdout_lock, sessions, selected, first_draw)?;
-        first_draw = false;
-
-        // Wait for input
-        let mut pfd = [nix::poll::PollFd::new(
-            unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stdin_fd) },
-            nix::poll::PollFlags::POLLIN,
-        )];
-        match nix::poll::poll(&mut pfd, nix::poll::PollTimeout::try_from(5000).unwrap()) {
-            Ok(0) => continue, // timeout, redraw
-            Ok(_) => {}
-            Err(e) => return Err(format!("poll: {}", e)),
-        }
-
-        // Read raw bytes from stdin
-        let n = match nix::unistd::read(stdin_fd, &mut buf) {
-            Ok(n) => n,
-            Err(e) => return Err(format!("read stdin: {}", e)),
-        };
-
-        let key = &buf[..n];
-
-        if key == b"\x1b" || key == b"\x03" {
-            // Esc or Ctrl-C → cancel
-            clear_picker(&mut stdout_lock, sessions.len())?;
-            return Ok(None);
-        } else if key == b"\r" || key == b"\n" {
-            // Enter → select
-            clear_picker(&mut stdout_lock, sessions.len())?;
-            return Ok(Some(sessions[selected].id.clone()));
-        } else if key == b"\x1b[A" || key == b"k" {
-            // Up arrow or k
-            if selected > 0 { selected -= 1; }
-        } else if key == b"\x1b[B" || key == b"j" {
-            // Down arrow or j
-            if selected + 1 < count { selected += 1; }
-        } else if key == b"\x1b[1;2A" || key == b"K" {
-            // Shift-Up or K → jump to top
-            selected = 0;
-        } else if key == b"\x1b[1;2B" || key == b"J" {
-            // Shift-Down or J → jump to bottom
-            selected = count - 1;
-        } else if !key.is_empty() && key[0] >= b'1' && key[0] <= b'9' {
-            // Number key → direct selection (1-based)
-            let idx = (key[0] - b'1') as usize;
-            if idx < count { selected = idx; }
-        }
-        // else: ignore unknown key
-    }
-}
-
-/// Draw the picker UI.
-/// On first draw, we print from the current cursor position.
-/// On subsequent draws, we move cursor up to overwrite the previous output.
-fn draw_picker(
-    stdout: &mut dyn std::io::Write,
-    sessions: &[agent_shell_core::protocol::SessionInfo],
-    selected: usize,
-    first_draw: bool,
-) -> Result<(), String> {
-    let line_count = sessions.len() + 1; // sessions + help line
-
-    if !first_draw {
-        // Move cursor up to the top of the picker area
-        write!(stdout, "\x1b[{}A", line_count).map_err(|e| format!("write: {}", e))?;
-    }
-
-    // Draw session lines
-    for (i, s) in sessions.iter().enumerate() {
-        let name = s.name.as_deref().unwrap_or("<unnamed>");
-        let indicator = if i == selected { "\u{276f}" } else { " " }; // ❯
-        let highlight_on = if i == selected { "\x1b[1;36m" } else { "" };
-        let highlight_off = if i == selected { "\x1b[0m" } else { "" };
-        let num = i + 1;
-        write!(
-            stdout,
-            "\x1b[2K\r{} {}{}{}. {} (pid {})\n",
-            indicator, highlight_on, num, highlight_off, name, s.pid,
-        )
-        .map_err(|e| format!("write: {}", e))?;
-    }
-
-    // Draw help line
-    write!(stdout, "\x1b[2K\r\x1b[2m\u{2191}\u{2193} select \u{00b7} Enter attach \u{00b7} Esc cancel\x1b[0m")
-        .map_err(|e| format!("write: {}", e))?;
-
-    stdout.flush().map_err(|e| format!("flush: {}", e))?;
-    Ok(())
-}
-
-/// Clear the picker from the terminal.
-fn clear_picker(stdout: &mut dyn std::io::Write, line_count: usize) -> Result<(), String> {
-    // Move down to the bottom of the picker area
-    write!(stdout, "\x1b[{}B", line_count).map_err(|e| format!("write: {}", e))?;
-    // Clear each line moving up
-    for _ in 0..=line_count {
-        write!(stdout, "\x1b[2K\x1b[1A\r").map_err(|e| format!("write: {}", e))?;
-    }
-    // Clear the help line
-    write!(stdout, "\x1b[2K\r").map_err(|e| format!("write: {}", e))?;
-    stdout.flush().map_err(|e| format!("flush: {}", e))?;
-    Ok(())
 }
 
 // ─── Attach: bidirectional raw streaming ─────────────────────────────
@@ -493,8 +374,6 @@ struct RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        // SAFETY: fd 0 is stdin, always valid while process is alive.
-        // BorrowedFd does not close on drop.
         let stdin_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) };
         let _ = nix::sys::termios::tcsetattr(
             &stdin_fd,
@@ -508,8 +387,6 @@ fn enter_raw_mode() -> Option<RawModeGuard> {
     if !std::io::stdin().is_terminal() {
         return None;
     }
-    // SAFETY: fd 0 is stdin, always valid while process is alive.
-    // BorrowedFd does not close on drop.
     let stdin_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) };
     let original = nix::sys::termios::tcgetattr(&stdin_fd).ok()?;
     let mut raw = original.clone();
