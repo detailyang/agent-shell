@@ -118,10 +118,10 @@ impl Config {
     }
 
     /// Return the effective socket path (resolving empty to default).
+    /// Supports AGENT_SHELL_HOME environment variable for test isolation.
     pub fn socket_path(&self) -> PathBuf {
         if self.daemon.socket_path.is_empty() {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".agent-shell/daemon.sock")
+            Self::base_dir().join("daemon.sock")
         } else {
             let p = shellexpand::tilde(&self.daemon.socket_path).to_string();
             PathBuf::from(p)
@@ -135,9 +135,14 @@ impl Config {
     }
 
     /// Return the base directory.
+    /// Supports AGENT_SHELL_HOME environment variable for test isolation.
     pub fn base_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".agent-shell")
+        if let Ok(custom) = std::env::var("AGENT_SHELL_HOME") {
+            PathBuf::from(custom)
+        } else {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join(".agent-shell")
+        }
     }
 }
 

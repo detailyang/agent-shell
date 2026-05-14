@@ -8,6 +8,7 @@ pub struct DaemonHandle {
     pub process: Child,
     socket_path: std::path::PathBuf,
     pub cli_bin: String,
+    _temp_dir: tempfile::TempDir, // Keep alive so directory isn't cleaned up prematurely
 }
 
 impl DaemonHandle {
@@ -15,6 +16,7 @@ impl DaemonHandle {
     pub fn cli(&self, args: &[&str]) -> Output {
         Command::new(&self.cli_bin)
             .args(args)
+            .env("AGENT_SHELL_HOME", self.temp_dir_path())
             .output()
             .expect("failed to execute CLI")
     }
@@ -26,6 +28,11 @@ impl DaemonHandle {
         serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
             panic!("failed to parse CLI output as JSON: {:?}\nOutput: {}", e, stdout)
         })
+    }
+
+    /// Get the temp directory path for AGENT_SHELL_HOME
+    pub fn temp_dir_path(&self) -> std::path::PathBuf {
+        self._temp_dir.path().to_path_buf()
     }
 
     /// Stop the daemon.
@@ -55,7 +62,7 @@ impl Drop for DaemonHandle {
     fn drop(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Temp dir cleaned up by tempfile::TempDir drop
     }
 }
 
@@ -161,11 +168,16 @@ impl AttachConnection {
 }
 
 /// Start a daemon process for testing.
+/// Each daemon gets its own isolated temp directory via AGENT_SHELL_HOME,
+/// so parallel tests don't conflict.
 pub fn start_daemon() -> DaemonHandle {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let base_dir = std::path::PathBuf::from(&home).join(".agent-shell");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base_dir = temp_dir.path().to_path_buf();
     let socket_path = base_dir.join("daemon.sock");
     let pid_path = base_dir.join("daemon.pid");
+
+    // Ensure directory exists
+    std::fs::create_dir_all(&base_dir).ok();
 
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
@@ -178,12 +190,13 @@ pub fn start_daemon() -> DaemonHandle {
         }
         let _ = std::fs::remove_file(&pid_path);
     }
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(100));
 
     let daemon_bin = find_bin("agent-shell-daemon");
     let cli_bin = find_bin("agent-shell");
 
     let process = Command::new(&daemon_bin)
+        .env("AGENT_SHELL_HOME", &base_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())  // Capture stderr for debugging
         .spawn()
@@ -198,9 +211,9 @@ pub fn start_daemon() -> DaemonHandle {
         retries -= 1;
     }
 
-    assert!(socket_path.exists(), "daemon socket did not appear");
+    assert!(socket_path.exists(), "daemon socket did not appear at {:?}", socket_path);
 
-    DaemonHandle { process, socket_path, cli_bin }
+    DaemonHandle { process, socket_path, cli_bin, _temp_dir: temp_dir }
 }
 
 pub fn find_bin(name: &str) -> String {

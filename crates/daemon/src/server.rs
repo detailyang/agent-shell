@@ -350,6 +350,7 @@ async fn handle_send(
         }
 
         seq = session.next_seq();
+        write_cursor_before = session.ringbuf.write_cursor();
 
         if let Some(ref ctrl) = ctrl {
             if let Err(e) = session.send_ctrl(ctrl) {
@@ -372,7 +373,6 @@ async fn handle_send(
 
         // Drain any immediate output
         session.feed();
-        write_cursor_before = session.ringbuf.write_cursor();
     }
 
     // Step 2: If nowait or ctrl, return immediately

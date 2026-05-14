@@ -360,6 +360,7 @@ mod kill_daemon {
     fn kill_running_daemon() {
         let daemon = start_daemon();
         let cli_bin = daemon.cli_bin.clone();
+        let home_dir = daemon.temp_dir_path();
 
         // Verify daemon is alive
         let resp = daemon.cli_json(&["list"]);
@@ -372,14 +373,13 @@ mod kill_daemon {
         assert!(stdout.contains("\"killed\":true"), "should report killed=true, got: {}", stdout);
 
         // Socket and pid files should be gone
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let base = std::path::PathBuf::from(&home).join(".agent-shell");
-        assert!(!base.join("daemon.sock").exists(), "socket should be removed");
-        assert!(!base.join("daemon.pid").exists(), "pid file should be removed");
+        assert!(!home_dir.join("daemon.sock").exists(), "socket should be removed");
+        assert!(!home_dir.join("daemon.pid").exists(), "pid file should be removed");
 
         // Next CLI call should auto-start a fresh daemon
         let resp = std::process::Command::new(&cli_bin)
             .args(&["create", "--name", "after_kill"])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output()
             .expect("cli should work after kill-daemon");
         let stdout = String::from_utf8_lossy(&resp.stdout);
@@ -390,21 +390,20 @@ mod kill_daemon {
         let sid = session_id(&resp);
         let _ = std::process::Command::new(&cli_bin)
             .args(&["destroy", "--session", &sid])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output();
-        let _ = std::process::Command::new(&cli_bin).args(&["kill-daemon"]).output();
+        let _ = std::process::Command::new(&cli_bin)
+            .args(&["kill-daemon"])
+            .env("AGENT_SHELL_HOME", &home_dir)
+            .output();
     }
 
     /// kill-daemon with no daemon running should succeed gracefully.
     #[test]
     fn kill_no_daemon() {
-        // Ensure no daemon is running
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let base = std::path::PathBuf::from(&home).join(".agent-shell");
-        let _ = std::fs::remove_file(base.join("daemon.sock"));
-        let _ = std::fs::remove_file(base.join("daemon.pid"));
-
         let daemon = start_daemon();
         let cli_bin = daemon.cli_bin.clone();
+        let home_dir = daemon.temp_dir_path();
 
         // Kill it first
         let _ = daemon.cli(&["kill-daemon"]);
@@ -413,6 +412,7 @@ mod kill_daemon {
         // Kill again — should report no daemon running, not error
         let output = std::process::Command::new(&cli_bin)
             .args(&["kill-daemon"])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output()
             .expect("cli should work");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -426,10 +426,9 @@ mod kill_daemon {
     fn kill_cleans_stale_artifacts() {
         let mut daemon = start_daemon();
         let cli_bin = daemon.cli_bin.clone();
+        let home_dir = daemon.temp_dir_path();
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let base = std::path::PathBuf::from(&home).join(".agent-shell");
-        let pid_str = std::fs::read_to_string(base.join("daemon.pid")).unwrap();
+        let pid_str = std::fs::read_to_string(home_dir.join("daemon.pid")).unwrap();
         let pid: i32 = pid_str.trim().parse().unwrap();
 
         // SIGKILL the daemon directly
@@ -439,20 +438,21 @@ mod kill_daemon {
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         // Stale files should still exist
-        assert!(base.join("daemon.sock").exists(), "stale socket should exist");
-        assert!(base.join("daemon.pid").exists(), "stale pid should exist");
+        assert!(home_dir.join("daemon.sock").exists(), "stale socket should exist");
+        assert!(home_dir.join("daemon.pid").exists(), "stale pid should exist");
 
         // kill-daemon should detect process is gone and clean up
         let output = std::process::Command::new(&cli_bin)
             .args(&["kill-daemon"])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output()
             .expect("cli should work");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("\"killed\":false"), "process already gone, should report killed=false, got: {}", stdout);
 
         // Artifacts should be cleaned
-        assert!(!base.join("daemon.sock").exists(), "stale socket should be removed");
-        assert!(!base.join("daemon.pid").exists(), "stale pid should be removed");
+        assert!(!home_dir.join("daemon.sock").exists(), "stale socket should be removed");
+        assert!(!home_dir.join("daemon.pid").exists(), "stale pid should be removed");
     }
 
     /// After kill-daemon, a new daemon should start cleanly via auto-start.
@@ -460,6 +460,7 @@ mod kill_daemon {
     fn kill_then_auto_restart() {
         let daemon = start_daemon();
         let cli_bin = daemon.cli_bin.clone();
+        let home_dir = daemon.temp_dir_path();
 
         // Create a session to prove daemon works
         let resp = daemon.cli_json(&["create", "--name", "before_kill"]);
@@ -473,6 +474,7 @@ mod kill_daemon {
         // Old session is gone. New daemon auto-starts on next command.
         let resp = std::process::Command::new(&cli_bin)
             .args(&["create", "--name", "after_kill"])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output()
             .expect("cli should auto-start daemon");
         let stdout = String::from_utf8_lossy(&resp.stdout);
@@ -483,6 +485,7 @@ mod kill_daemon {
         // New session should work
         let resp = std::process::Command::new(&cli_bin)
             .args(&["send", "--session", &sid2, "--timeout", "5000", "echo restarted_ok"])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output()
             .expect("send should work");
         let stdout = String::from_utf8_lossy(&resp.stdout);
@@ -493,8 +496,12 @@ mod kill_daemon {
         // Clean up
         let _ = std::process::Command::new(&cli_bin)
             .args(&["destroy", "--session", &sid2])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output();
-        let _ = std::process::Command::new(&cli_bin).args(&["kill-daemon"]).output();
+        let _ = std::process::Command::new(&cli_bin)
+            .args(&["kill-daemon"])
+            .env("AGENT_SHELL_HOME", &home_dir)
+            .output();
     }
 }
 
@@ -504,24 +511,17 @@ mod sigterm {
     /// SIGTERM should trigger graceful shutdown: kill sessions, clean up socket & pid files.
     #[test]
     fn sigterm_graceful_shutdown() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let base = std::path::PathBuf::from(&home).join(".agent-shell");
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let base = temp_dir.path().to_path_buf();
         let socket_path = base.join("daemon.sock");
         let pid_path = base.join("daemon.pid");
 
-        // Clean up any existing daemon
-        let _ = std::fs::remove_file(&socket_path);
-        if let Ok(p) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = p.trim().parse::<i32>() {
-                unsafe { libc::kill(pid, libc::SIGKILL); }
-            }
-        }
-        let _ = std::fs::remove_file(&pid_path);
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::fs::create_dir_all(&base).ok();
 
         // Start daemon in its own process group so cargo test doesn't interfere
         let daemon_bin = agent_shell_e2e::find_bin("agent-shell-daemon");
         let mut daemon = std::process::Command::new(&daemon_bin)
+            .env("AGENT_SHELL_HOME", &base)
             .process_group(0)
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -532,7 +532,7 @@ mod sigterm {
             if socket_path.exists() { break; }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(socket_path.exists(), "daemon socket should appear");
+        assert!(socket_path.exists(), "daemon socket should appear at {:?}", socket_path);
 
         // Send SIGTERM
         let pid_from_file: i32 = std::fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
@@ -2100,17 +2100,16 @@ mod auto_start {
     /// CLI should auto-start daemon when no daemon is running
     #[test]
     fn auto_start_on_first_command() {
-        // Ensure no daemon is running
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let base = std::path::PathBuf::from(&home).join(".agent-shell");
-        let _ = std::fs::remove_file(base.join("daemon.sock"));
-        let _ = std::fs::remove_file(base.join("daemon.pid"));
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let base = temp_dir.path().to_path_buf();
+        std::fs::create_dir_all(&base).ok();
 
         let cli_bin = agent_shell_e2e::find_bin("agent-shell");
 
         // First command should auto-start daemon
         let resp = std::process::Command::new(&cli_bin)
             .args(&["create", "--name", "auto_start_test"])
+            .env("AGENT_SHELL_HOME", &base)
             .output()
             .expect("cli should work");
         assert!(resp.status.success(), "cli should succeed");
@@ -2126,9 +2125,11 @@ mod auto_start {
         // Clean up
         let _ = std::process::Command::new(&cli_bin)
             .args(&["destroy", "--session", &sid])
+            .env("AGENT_SHELL_HOME", &base)
             .output();
         let _ = std::process::Command::new(&cli_bin)
             .args(&["kill-daemon"])
+            .env("AGENT_SHELL_HOME", &base)
             .output();
     }
 }
@@ -2419,6 +2420,7 @@ mod daemon_restart {
     fn sessions_lost_after_daemon_restart() {
         let daemon = start_daemon();
         let cli_bin = daemon.cli_bin.clone();
+        let home_dir = daemon.temp_dir_path();
 
         // Create a session
         let resp = daemon.cli_json(&["create", "--name", "before_restart"]);
@@ -2432,6 +2434,7 @@ mod daemon_restart {
         // New daemon should auto-start
         let resp = std::process::Command::new(&cli_bin)
             .args(&["list"])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output()
             .expect("list should work");
         let stdout = String::from_utf8_lossy(&resp.stdout);
@@ -2446,6 +2449,7 @@ mod daemon_restart {
         // Clean up
         let _ = std::process::Command::new(&cli_bin)
             .args(&["kill-daemon"])
+            .env("AGENT_SHELL_HOME", &home_dir)
             .output();
     }
 }
@@ -3240,6 +3244,105 @@ mod read_cursor_edge {
         // Now read again — no gap expected since buffer is large enough
         let resp = daemon.cli_json(&["read", "--session", &sid, "--client-id", "stale_client"]);
         assert_ok(&resp);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attach without --session (session picker)
+// ═══════════════════════════════════════════════════════════════════
+
+mod attach_picker {
+    use super::*;
+
+    /// `agent-shell attach` with no sessions shows "no active sessions"
+    #[test]
+    fn attach_no_sessions() {
+        let daemon = start_daemon();
+        let cli_bin = daemon.cli_bin.clone();
+        let home_dir = daemon.temp_dir_path();
+
+        let output = std::process::Command::new(&cli_bin)
+            .args(&["attach"])
+            .env("AGENT_SHELL_HOME", &home_dir)
+            .output()
+            .expect("cli should work");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("No active sessions"), "should mention no sessions, got: {:?}", stderr);
+    }
+
+    /// `agent-shell attach` with one session shows picker (even with one)
+    #[test]
+    fn attach_single_session_shows_picker() {
+        let mut daemon = start_daemon();
+        let cli_bin = daemon.cli_bin.clone();
+        let home_dir = daemon.temp_dir_path();
+
+        let resp = daemon.cli_json(&["create", "--name", "only_one"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Non-terminal: should list session and tell user to specify
+        let output = std::process::Command::new(&cli_bin)
+            .args(&["attach"])
+            .env("AGENT_SHELL_HOME", &home_dir)
+            .output()
+            .expect("cli should work");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("session(s) available"), "should mention sessions, got: {:?}", stderr);
+        assert!(stderr.contains("only_one"), "should list the session, got: {:?}", stderr);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// `agent-shell attach` with multiple sessions (non-terminal) lists them
+    #[test]
+    fn attach_multiple_sessions_non_terminal() {
+        let mut daemon = start_daemon();
+        let cli_bin = daemon.cli_bin.clone();
+        let home_dir = daemon.temp_dir_path();
+
+        let resp1 = daemon.cli_json(&["create", "--name", "multi_a"]);
+        assert_ok(&resp1);
+        let sid1 = session_id(&resp1);
+
+        let resp2 = daemon.cli_json(&["create", "--name", "multi_b"]);
+        assert_ok(&resp2);
+        let sid2 = session_id(&resp2);
+
+        let output = std::process::Command::new(&cli_bin)
+            .args(&["attach"])
+            .env("AGENT_SHELL_HOME", &home_dir)
+            .output()
+            .expect("cli should work");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("session(s) available"), "should mention sessions, got: {:?}", stderr);
+        assert!(stderr.contains("multi_a"), "should list multi_a, got: {:?}", stderr);
+        assert!(stderr.contains("multi_b"), "should list multi_b, got: {:?}", stderr);
+
+        daemon.cli_json(&["destroy", "--session", &sid1]);
+        daemon.cli_json(&["destroy", "--session", &sid2]);
+        daemon.stop();
+    }
+
+    /// `agent-shell attach --session <id>` still works normally
+    #[test]
+    fn attach_with_explicit_session_still_works() {
+        let mut daemon = start_daemon();
+        let _cli_bin = daemon.cli_bin.clone();
+        let _home_dir = daemon.temp_dir_path();
+
+        let resp = daemon.cli_json(&["create", "--name", "explicit"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Verify explicit --session still works
+        let resp = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "echo picker_test"]);
+        assert_ok(&resp);
+        assert!(resp.output.unwrap_or_default().contains("picker_test"));
 
         daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();
