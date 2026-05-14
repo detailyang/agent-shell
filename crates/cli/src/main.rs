@@ -88,8 +88,8 @@ enum Commands {
     Attach {
         #[arg(long, short)]
         session: Option<String>,
-        #[arg(long)]
-        readonly: bool,
+        #[arg(long, short = 'W')]
+        writable: bool,
     },
     /// Resize a session terminal
     Resize {
@@ -128,7 +128,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Attach { session, readonly } => {
+        Commands::Attach { session, writable } => {
             let config = Config::load();
             let socket_path = config.socket_path();
 
@@ -149,7 +149,7 @@ async fn main() {
 
             let req = Request::Attach {
                 session_id,
-                readonly: if readonly { Some(true) } else { None },
+                writable: if writable { Some(true) } else { None },
             };
             match run_attach(&socket_path, req).await {
                 Ok(_) => {}
@@ -248,9 +248,9 @@ fn command_to_request(cmd: Commands) -> Request {
         },
         Commands::SetPrompt { session, prompt } => Request::SetPrompt { session_id: session, prompt },
         Commands::List => Request::List,
-        Commands::Attach { session, readonly } => Request::Attach {
+        Commands::Attach { session, writable } => Request::Attach {
             session_id: session.unwrap_or_default(),
-            readonly: if readonly { Some(true) } else { None },
+            writable: if writable { Some(true) } else { None },
         },
         Commands::Resize { session, rows, cols } => Request::Resize { session_id: session, rows, cols },
         Commands::Stop => Request::Stop,
@@ -519,7 +519,7 @@ fn enter_raw_mode() -> Option<RawModeGuard> {
 }
 
 async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
-    let readonly = matches!(&req, Request::Attach { readonly: Some(true), .. });
+    let readonly = !matches!(&req, Request::Attach { writable: Some(true), .. });
 
     // Auto-start daemon if needed
     let mut stream = match tokio::net::UnixStream::connect(socket_path).await {
@@ -584,14 +584,35 @@ async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
         let mut socket_buf = [0u8; 4096];
 
         if readonly {
-            // readonly: only read from daemon → stdout
-            match stream_rx.read(&mut socket_buf).await {
-                Ok(0) => running = false,
-                Ok(n) => {
-                    let _ = std::io::stdout().write_all(&socket_buf[..n]);
-                    let _ = std::io::stdout().flush();
+            // readonly (default): only read from daemon → stdout
+            // Ctrl-D (0x04) exits, Ctrl-C (0x03) also exits
+            tokio::select! {
+                // daemon → stdout (raw PTY output)
+                result = stream_rx.read(&mut socket_buf) => {
+                    match result {
+                        Ok(0) => running = false,
+                        Ok(n) => {
+                            let _ = std::io::stdout().write_all(&socket_buf[..n]);
+                            let _ = std::io::stdout().flush();
+                        }
+                        Err(_) => running = false,
+                    }
                 }
-                Err(_) => running = false,
+                // stdin → check for exit keys only
+                result = stdin_handle.read(&mut stdin_buf) => {
+                    match result {
+                        Ok(0) => running = false, // stdin EOF
+                        Ok(n) => {
+                            let data = &stdin_buf[..n];
+                            // Ctrl-C or Ctrl-D exits readonly attach
+                            if data.contains(&0x03) || data.contains(&0x04) {
+                                running = false;
+                            }
+                            // All other input ignored in readonly mode
+                        }
+                        Err(_) => running = false,
+                    }
+                }
             }
         } else {
             tokio::select! {

@@ -145,10 +145,10 @@ async fn handle_connection(mut stream: tokio::net::UnixStream, state: Arc<Mutex<
     // Handle attach specially (streaming)
     if let Request::Attach {
         session_id,
-        readonly,
+        writable,
     } = req
     {
-        handle_attach(stream, state, session_id, readonly.unwrap_or(false)).await;
+        handle_attach(stream, state, session_id, !writable.unwrap_or(false)).await;
         return;
     }
 

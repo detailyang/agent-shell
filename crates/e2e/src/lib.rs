@@ -46,15 +46,15 @@ impl DaemonHandle {
         &self,
         session_id: &str,
     ) -> Result<AttachConnection, String> {
-        AttachConnection::new(&self.socket_path, session_id, false)
+        AttachConnection::new(&self.socket_path, session_id, true)
     }
 
-    /// Connect to the daemon's Unix socket for readonly attach testing.
+    /// Connect to the daemon's Unix socket for readonly attach testing (default mode).
     pub fn connect_attach_ro(
         &self,
         session_id: &str,
     ) -> Result<AttachConnection, String> {
-        AttachConnection::new(&self.socket_path, session_id, true)
+        AttachConnection::new(&self.socket_path, session_id, false)
     }
 }
 
@@ -77,7 +77,7 @@ impl AttachConnection {
     pub fn new(
         socket_path: &std::path::Path,
         session_id: &str,
-        readonly: bool,
+        writable: bool,
     ) -> Result<Self, String> {
         let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
             .map_err(|e| format!("connect: {}", e))?;
@@ -87,7 +87,7 @@ impl AttachConnection {
         // Send Attach request
         let req = Request::Attach {
             session_id: session_id.to_string(),
-            readonly: if readonly { Some(true) } else { None },
+            writable: if writable { Some(true) } else { None },
         };
         let data = serde_json::to_vec(&req).map_err(|e| format!("serialize: {}", e))?;
         let len = data.len() as u32;
@@ -256,4 +256,126 @@ pub fn assert_error(resp: &Response, expected_error: &str) {
 /// Extract session_id from a response.
 pub fn session_id(resp: &Response) -> String {
     resp.session_id.clone().expect("expected session_id in response")
+}
+
+// ─── Render test helpers ──────────────────────────────────────────────
+
+/// Which data path to test.
+#[derive(Debug, Clone, Copy)]
+pub enum RenderPath {
+    /// Attach raw stream — validates raw bytes contain full escape sequences.
+    Attach,
+    /// `read` command — validates output field contains full escape sequences.
+    ReadRaw,
+    /// `read --screen` — validates VteGrid parsed text + cursor position.
+    ReadScreen,
+}
+
+/// Send a printf command via CLI, then read output through the given path
+/// and assert it contains the expected escape sequence and text.
+pub fn assert_render(
+    daemon: &DaemonHandle,
+    sid: &str,
+    printf_cmd: &str,
+    path: RenderPath,
+    expected_escape: &[u8],
+    expected_text: &str,
+) {
+    // Send the command first
+    let resp = daemon.cli_json(&[
+        "send", "--session", sid, "--timeout", "5000", printf_cmd,
+    ]);
+    assert_ok(&resp);
+
+    match path {
+        RenderPath::Attach => {
+            let mut conn = daemon.connect_attach_rw(sid).expect("attach connect");
+            let mut bytes = conn.initial_output.clone();
+            let stream = conn.read_output(std::time::Duration::from_millis(500));
+            bytes.extend_from_slice(&stream);
+            assert_contains_escape(&bytes, expected_escape, "attach render");
+            assert_contains_text(&bytes, expected_text, "attach render");
+        }
+        RenderPath::ReadRaw => {
+            let resp = daemon.cli_json(&["read", "--session", sid]);
+            assert_ok(&resp);
+            let output = resp.output.unwrap_or_default();
+            // read output is UTF-8 lossy converted; escape sequences are still present as bytes
+            let bytes = output.as_bytes();
+            assert_contains_escape(bytes, expected_escape, "read render");
+            assert_contains_text(bytes, expected_text, "read render");
+        }
+        RenderPath::ReadScreen => {
+            let resp = daemon.cli_json(&["read", "--session", sid, "--screen"]);
+            assert_ok(&resp);
+            let screen = resp.screen.expect("expected screen data");
+            let text = screen.join("\n");
+            assert!(
+                text.contains(expected_text),
+                "screen render: expected text '{}' not found. Screen: {:?}",
+                expected_text, &text[..text.len().min(500)]
+            );
+        }
+    }
+}
+
+/// Assert raw bytes contain the given escape sequence.
+pub fn assert_contains_escape(bytes: &[u8], needle: &[u8], label: &str) {
+    assert!(
+        bytes.windows(needle.len()).any(|w| w == needle),
+        "{}: expected byte sequence {:?} not found.\n\
+         Tail hex: {}\n\
+         Tail text: {:?}",
+        label, needle,
+        hex_dump(&bytes[bytes.len().saturating_sub(80)..]),
+        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(200)..]),
+    );
+}
+
+/// Assert raw bytes contain the given text.
+pub fn assert_contains_text(bytes: &[u8], text: &str, label: &str) {
+    let output = String::from_utf8_lossy(bytes);
+    assert!(
+        output.contains(text),
+        "{}: expected text '{}' not found. Output tail: {:?}",
+        label, text, &output[..output.len().min(500)],
+    );
+}
+
+/// Assert bytes do not end with a truncated escape sequence.
+/// A truncated escape is a bare `\x1b` at the end without a following `[` or `]`.
+pub fn assert_no_truncated_escape(bytes: &[u8], label: &str) {
+    if bytes.len() >= 1 && bytes[bytes.len() - 1] == 0x1b {
+        panic!(
+            "{}: output ends with bare ESC (truncated escape sequence).\n\
+             Tail hex: {}\n\
+             Tail text: {:?}",
+            label,
+            hex_dump(&bytes[bytes.len().saturating_sub(40)..]),
+            String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(100)..]),
+        );
+    }
+    // Also check if ESC is second-to-last with incomplete sequence
+    if bytes.len() >= 2 {
+        let last_two = &bytes[bytes.len() - 2..];
+        if last_two[0] == 0x1b && last_two[1] != b'[' && last_two[1] != b']' && last_two[1] != b'O' {
+            // Could be a valid 2-byte ESC sequence (ESC + letter), but not CSI/OSC
+            // This is a soft warning — only panic for truly truncated CSI/OSC
+            // ESC followed by a letter (like ESC M) is valid, so we don't panic here.
+        }
+    }
+    // Check for truncated CSI: ESC [ without the final letter
+    if bytes.len() >= 2 && bytes[bytes.len() - 2] == 0x1b && bytes[bytes.len() - 1] == b'[' {
+        panic!(
+            "{}: output ends with ESC [ (truncated CSI sequence).\n\
+             Tail hex: {}",
+            label,
+            hex_dump(&bytes[bytes.len().saturating_sub(40)..]),
+        );
+    }
+}
+
+/// Hex dump of bytes.
+pub fn hex_dump(data: &[u8]) -> String {
+    data.iter().take(200).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
 }

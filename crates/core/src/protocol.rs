@@ -58,7 +58,7 @@ pub enum Request {
     #[serde(rename = "attach")]
     Attach {
         session_id: String,
-        readonly: Option<bool>,
+        writable: Option<bool>,
     },
 
     #[serde(rename = "resize")]

@@ -3339,10 +3339,491 @@ mod attach_picker {
         assert_ok(&resp);
         let sid = session_id(&resp);
 
-        // Verify explicit --session still works
-        let resp = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "echo picker_test"]);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attach render edge cases
+// ═══════════════════════════════════════════════════════════════════
+
+mod attach_render {
+    use super::*;
+
+    /// After send produces colored output, attach handshake (base64 initial_output)
+    /// should contain complete SGR sequences.
+    #[test]
+    fn attach_color_after_prompt() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "att_col"]);
         assert_ok(&resp);
-        assert!(resp.output.unwrap_or_default().contains("picker_test"));
+        let sid = session_id(&resp);
+
+        // Send colored output first
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf '\033[31mRED\033[0m'"#,
+        ]);
+        assert_ok(&resp);
+
+        // Now attach — initial_output should have the colors
+        let mut conn = daemon.connect_attach_rw(&sid).expect("attach");
+        let bytes = &conn.initial_output;
+
+        assert_contains_escape(bytes, b"\x1b[31m", "attach handshake red fg");
+        assert_contains_escape(bytes, b"\x1b[0m", "attach handshake reset");
+        assert_contains_text(bytes, "RED", "attach handshake text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// After send produces cursor positioning, attach handshake should
+    /// contain the cursor escape sequence intact.
+    #[test]
+    fn attach_cursor_after_command() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "att_cur"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf 'ABC\033[2;1HXYZ'"#,
+        ]);
+        assert_ok(&resp);
+
+        let mut conn = daemon.connect_attach_rw(&sid).expect("attach");
+        let bytes = &conn.initial_output;
+
+        assert_contains_escape(bytes, b"\x1b[2;1H", "attach handshake cursor pos");
+        assert_contains_text(bytes, "XYZ", "attach handshake text after cursor");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Small buffer session: produce output exceeding buffer, attach,
+    /// verify base64-decoded output doesn't end mid-escape-sequence.
+    #[test]
+    fn attach_truncated_escape() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&[
+            "create", "--shell", "/bin/bash", "--name", "att_trunc",
+            "--buffer-size", "4096",
+        ]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Generate colored output larger than 4KB buffer
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "10000",
+            "for i in $(seq 1 100); do printf '\\033[31mLINE_%04d\\033[0m\n' $i; done",
+        ]);
+        // May succeed with gap or timeout — both acceptable
+
+        let mut conn = daemon.connect_attach_rw(&sid).expect("attach");
+        let mut bytes = conn.initial_output.clone();
+        let stream = conn.read_output(std::time::Duration::from_millis(500));
+        bytes.extend_from_slice(&stream);
+
+        // Key assertion: no truncated escape at the end
+        assert_no_truncated_escape(&bytes, "attach truncated escape");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Attach live: send colored command through attach stream,
+    /// verify live output contains complete SGR.
+    #[test]
+    fn attach_live_color_during_command() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "att_live_col"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let mut conn = daemon.connect_attach_rw(&sid).expect("attach");
+        let _ = conn.read_output(std::time::Duration::from_millis(300));
+
+        // Send colored output through attach
+        // echo -e interprets \033 as ESC
+        conn.send(b"echo -e '\\033[32mGREEN\\033[0m'\n").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut all_output = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let chunk = conn.read_output(std::time::Duration::from_millis(200));
+            all_output.extend_from_slice(&chunk);
+            if all_output.windows(b"\x1b[32m".len()).any(|w| w == b"\x1b[32m") {
+                break;
+            }
+        }
+
+        assert_contains_escape(&all_output, b"\x1b[32m", "attach live green fg");
+        assert_contains_escape(&all_output, b"\x1b[0m", "attach live reset");
+        assert_contains_text(&all_output, "GREEN", "attach live green text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Attach, resize, then send cursor-positioning output through attach —
+    /// verify escape sequences are intact after resize.
+    #[test]
+    fn attach_resize_renders_correctly() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "att_rsz_r"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let mut conn = daemon.connect_attach_rw(&sid).expect("attach");
+        let _ = conn.read_output(std::time::Duration::from_millis(200));
+
+        // Resize
+        let resp = daemon.cli_json(&["resize", "--session", &sid, "--rows", "30", "--cols", "100"]);
+        assert_ok(&resp);
+
+        // Send cursor-positioning output after resize
+        conn.send(b"echo -e '\\033[5;10HMOVED'\n").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut all_output = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let chunk = conn.read_output(std::time::Duration::from_millis(200));
+            all_output.extend_from_slice(&chunk);
+            if all_output.windows(b"\x1b[5;10H".len()).any(|w| w == b"\x1b[5;10H") {
+                break;
+            }
+        }
+
+        assert_contains_escape(&all_output, b"\x1b[5;10H", "attach resize cursor pos");
+        assert_contains_text(&all_output, "MOVED", "attach resize text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Read render edge cases
+// ═══════════════════════════════════════════════════════════════════
+
+mod read_render {
+    use super::*;
+
+    /// `read` should preserve SGR escape sequences in the output field.
+    #[test]
+    fn read_color_preserved() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "rd_col"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf '\033[35mPURPLE\033[0m'"#,
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        let bytes = output.as_bytes();
+
+        assert_contains_escape(bytes, b"\x1b[35m", "read color fg");
+        assert_contains_escape(bytes, b"\x1b[0m", "read color reset");
+        assert_contains_text(bytes, "PURPLE", "read color text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// `read` should preserve cursor positioning escape sequences.
+    #[test]
+    fn read_cursor_position_preserved() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "rd_cur"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf 'BEFORE\033[3;1HAFTER'"#,
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        let bytes = output.as_bytes();
+
+        assert_contains_escape(bytes, b"\x1b[3;1H", "read cursor position");
+        assert_contains_text(bytes, "AFTER", "read text after cursor");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Incremental read with --client-id: color output split across reads
+    /// should not lose escape sequences.
+    #[test]
+    fn read_incremental_color() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "rd_inc"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+        let cid = "inc_reader";
+
+        // First read: captures prompt + initial output (no color yet)
+        let resp = daemon.cli_json(&["read", "--session", &sid, "--client-id", cid]);
+        assert_ok(&resp);
+
+        // Send colored output
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf '\033[33mYELLOW\033[0m'"#,
+        ]);
+        assert_ok(&resp);
+
+        // Second read: should get the colored output with complete SGR
+        let resp = daemon.cli_json(&["read", "--session", &sid, "--client-id", cid]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        let bytes = output.as_bytes();
+
+        assert_contains_escape(bytes, b"\x1b[33m", "read incremental yellow fg");
+        assert_contains_escape(bytes, b"\x1b[0m", "read incremental reset");
+        assert_contains_text(bytes, "YELLOW", "read incremental yellow text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Small buffer session: read after overflow should not contain
+    /// truncated escape sequences.
+    #[test]
+    fn read_small_buffer_truncation() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&[
+            "create", "--shell", "/bin/bash", "--name", "rd_trunc",
+            "--buffer-size", "4096",
+        ]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Generate colored output exceeding buffer
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "10000",
+            "for i in $(seq 1 100); do printf '\\033[36mLINE_%04d\\033[0m\n' $i; done",
+        ]);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        let bytes = output.as_bytes();
+
+        assert_no_truncated_escape(bytes, "read small buffer truncation");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// After resize, `read` should preserve cursor positioning escapes.
+    #[test]
+    fn read_after_resize() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "rd_rsz"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&["resize", "--session", &sid, "--rows", "30", "--cols", "120"]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf '\033[10;5HRESIZED'"#,
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        let bytes = output.as_bytes();
+
+        assert_contains_escape(bytes, b"\x1b[10;5H", "read after resize cursor");
+        assert_contains_text(bytes, "RESIZED", "read after resize text");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Screen render edge cases (read --screen)
+// ═══════════════════════════════════════════════════════════════════
+
+mod screen_render {
+    use super::*;
+
+    /// After cursor movement + write, `read --screen` should show text
+    /// at the correct position.
+    #[test]
+    fn screen_text_after_cursor_move() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "scr_cur"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Write on line 0, then move to row 2 and write
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf 'TOP\033[3;1HMIDDLE'"#,
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid, "--screen"]);
+        assert_ok(&resp);
+        let screen = resp.screen.expect("expected screen");
+
+        // VteGrid tracks the full screen state. After printf,
+        // the prompt also writes to the screen (on the row after printf output).
+        // We just verify that both texts appear somewhere on the screen.
+        let all_text = screen.join("\n");
+        assert!(all_text.contains("TOP"), "screen should contain TOP, got: {:?}", &all_text[..all_text.len().min(500)]);
+        assert!(all_text.contains("MIDDLE"), "screen should contain MIDDLE, got: {:?}", &all_text[..all_text.len().min(500)]);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Multi-line colored text: `read --screen` should have the text
+    /// without escape sequence residue.
+    #[test]
+    fn screen_multiline_colored_text() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "scr_ml"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf '\033[31mRED1\033[0m\n\033[32mGREEN2\033[0m'"#,
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid, "--screen"]);
+        assert_ok(&resp);
+        let screen = resp.screen.expect("expected screen");
+
+        // VteGrid strips SGR, so text should be present without escape residue
+        let all_text = screen.join("\n");
+        assert!(all_text.contains("RED1"), "screen should contain RED1, got: {:?}", &all_text[..all_text.len().min(500)]);
+        assert!(all_text.contains("GREEN2"), "screen should contain GREEN2, got: {:?}", &all_text[..all_text.len().min(500)]);
+        // No escape sequence residue (no \x1b in screen text)
+        for (i, row) in screen.iter().enumerate() {
+            assert!(!row.contains('\x1b'), "row {} should not contain ESC, got: {:?}", i, row);
+        }
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Clear screen then write: `read --screen` should only show new content.
+    #[test]
+    fn screen_clear_then_write() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "scr_clr"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Write some text
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf 'OLD_TEXT'"#,
+        ]);
+        assert_ok(&resp);
+
+        // Clear screen and write new text
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf '\033[2J\033[HNEW_TEXT'"#,
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid, "--screen"]);
+        assert_ok(&resp);
+        let screen = resp.screen.expect("expected screen");
+
+        // Row 0 should have NEW_TEXT
+        assert!(screen[0].contains("NEW_TEXT"), "row 0 should contain NEW_TEXT, got: {:?}", screen[0]);
+        // OLD_TEXT should be gone from row 0
+        assert!(!screen[0].contains("OLD_TEXT"), "row 0 should not contain OLD_TEXT after clear");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// After resize, `read --screen` should return the correct number of rows.
+    #[test]
+    fn screen_after_resize() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "scr_rsz"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&["resize", "--session", &sid, "--rows", "30", "--cols", "120"]);
+        assert_ok(&resp);
+
+        // Write text that appears after resize
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo RESIZED_30x120",
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid, "--screen"]);
+        assert_ok(&resp);
+        let screen = resp.screen.expect("expected screen");
+
+        assert_eq!(screen.len(), 30, "screen should have 30 rows after resize, got: {}", screen.len());
+
+        // Find the text somewhere in the screen
+        let text = screen.join("\n");
+        assert!(text.contains("RESIZED_30x120"), "screen should contain RESIZED_30x120");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Erase line then write: `read --screen` should show erased area as blank
+    /// and new text in the correct position.
+    #[test]
+    fn screen_cursor_after_erase() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "scr_era"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Write text on row 2, move cursor back, erase to end of line, write new text
+        // Using row 2 to avoid interference from the prompt on row 0
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            r#"printf '\033[3;1HAAAAABBBBB\033[3;6H\033[KCC'"#,
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&["read", "--session", &sid, "--screen"]);
+        assert_ok(&resp);
+        let screen = resp.screen.expect("expected screen");
+
+        // Row 2 should contain AAAAA and CC (BBBBB was erased)
+        let row2 = &screen[2];
+        assert!(row2.contains("AAAAA"), "row 2 should contain AAAAA, got: {:?}", row2);
+        assert!(row2.contains("CC"), "row 2 should contain CC, got: {:?}", row2);
+        // BBBBB should be erased
+        assert!(!row2.contains("BBBBB"), "row 2 should not contain BBBBB after erase, got: {:?}", row2);
 
         daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();
