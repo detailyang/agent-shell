@@ -947,14 +947,22 @@ async fn handle_attach(
         let mut stdin_buf = [0u8; 4096];
 
         if readonly {
-            // ── readonly: wait for PTY data via AsyncFd ──
+            // ── readonly: wait for PTY data or periodic ringbuf check ──
+            // We must periodically check the ringbuf even when the PTY fd
+            // isn't readable, because `send` may have already drained the
+            // PTY output into the ringbuf via feed().
             if let Some(ref async_fd) = async_fd {
-                match async_fd.readable().await {
-                    Ok(mut guard) => {
-                        // Clear readiness before reading to avoid spurious wakeups
-                        guard.clear_ready();
+                tokio::select! {
+                    result = async_fd.readable() => {
+                        match result {
+                            Ok(mut guard) => { guard.clear_ready(); }
+                            Err(_) => { running = false; continue; }
+                        }
                     }
-                    Err(_) => { running = false; continue; }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        // Periodic ringbuf check — ensures we pick up data
+                        // that was already drained from the PTY by send/read handlers.
+                    }
                 }
             } else {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -992,6 +1000,8 @@ async fn handle_attach(
                             Err(_) => { running = false; continue; }
                         }
                     }
+                    // Periodic ringbuf check (same reason as readonly)
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                 }
             } else {
                 // Fallback: no raw fd available, poll at 5ms

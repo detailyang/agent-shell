@@ -236,9 +236,10 @@ impl Session {
     /// Send a control character to the PTY.
     pub fn send_ctrl(&mut self, ctrl: &str) -> Result<(), String> {
         let byte = match ctrl {
-            "c" => 0x03,
-            "d" => 0x04,
-            "z" => 0x1a,
+            "c" => 0x03,  // ETX (SIGINT)
+            "d" => 0x04,  // EOT (EOF)
+            "z" => 0x1a,  // SUB (SIGTSTP)
+            "\\" => 0x1c, // FS  (SIGQUIT)
             _ => return Err(format!("unknown control char: {}", ctrl)),
         };
         let mut writer = self.pty_writer.lock().unwrap();
