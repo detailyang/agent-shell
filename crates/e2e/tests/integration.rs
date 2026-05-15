@@ -4073,3 +4073,169 @@ mod audit_fix {
         daemon.stop();
     }
 }
+
+mod mouse {
+    use super::*;
+
+    #[test]
+    fn mouse_click_basic() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_click"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "click", "--x", "10", "--y", "5",
+        ]);
+        assert_ok(&resp);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_scroll() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_scroll"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "scroll",
+            "--x", "10", "--y", "5", "--direction", "up", "--count", "3",
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "scroll",
+            "--x", "10", "--y", "5", "--direction", "down",
+        ]);
+        assert_ok(&resp);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_drag() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_drag"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "drag",
+            "--x", "1", "--y", "1",
+            "--to-x", "20", "--to-y", "10",
+            "--steps", "5",
+        ]);
+        assert_ok(&resp);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_invalid_coords_zero() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_bad"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // x=0 is invalid (1-based)
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "click", "--x", "0", "--y", "5",
+        ]);
+        assert_error(&resp, "coordinate");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_invalid_coords_exceeds() {
+        let mut daemon = start_daemon();
+        // Default terminal is 80x24
+        let resp = daemon.cli_json(&["create", "--name", "mouse_oob"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // x=81 exceeds default 80 cols
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "click", "--x", "81", "--y", "5",
+        ]);
+        assert_error(&resp, "exceeds");
+
+        // y=25 exceeds default 24 rows
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "click", "--x", "10", "--y", "25",
+        ]);
+        assert_error(&resp, "exceeds");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_exited_session() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_exit"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Exit the shell
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--ctrl", "d"]);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "click", "--x", "10", "--y", "5",
+        ]);
+        assert_error(&resp, "exited");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_count_limit() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_limit"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "click",
+            "--x", "10", "--y", "5", "--count", "101",
+        ]);
+        assert_error(&resp, "count");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_press_release_move() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_prim"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "press", "--x", "5", "--y", "5",
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "move", "--x", "10", "--y", "10",
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "release", "--x", "10", "--y", "10",
+        ]);
+        assert_ok(&resp);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+}

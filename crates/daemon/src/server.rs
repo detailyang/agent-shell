@@ -227,6 +227,19 @@ async fn handle_request(req: Request, state: Arc<Mutex<AppState>>) -> Response {
             cols,
         } => handle_resize(state, session_id, rows, cols).await,
 
+        Request::Mouse {
+            session_id,
+            action,
+            x,
+            y,
+            button,
+            direction,
+            count,
+            to_x,
+            to_y,
+            steps,
+        } => handle_mouse(state, session_id, action, x, y, button, direction, count, to_x, to_y, steps).await,
+
         Request::Stop => unreachable!("Stop is handled in handle_connection"),
         Request::Attach { .. } => unreachable!(),
     }
@@ -877,6 +890,125 @@ async fn handle_resize(
             ..Response::ok()
         },
         Err(e) => Response::err(e),
+    }
+}
+
+async fn handle_mouse(
+    state: Arc<Mutex<AppState>>,
+    session_id: String,
+    action: String,
+    x: u16,
+    y: u16,
+    button: Option<String>,
+    direction: Option<String>,
+    count: Option<u16>,
+    to_x: Option<u16>,
+    to_y: Option<u16>,
+    steps: Option<u16>,
+) -> Response {
+    use agent_shell_core::mouse;
+
+    let mut s = state.lock().await;
+    let session = match s.sessions.get_mut(&session_id) {
+        Some(s) => s,
+        None => return Response::err("session not found"),
+    };
+
+    if session.destroying {
+        return Response::err("session is being destroyed");
+    }
+
+    if session.exited.is_some() {
+        return Response::err("session exited");
+    }
+
+    // Validate coordinates
+    if x == 0 || y == 0 {
+        return Response::err("coordinates must be >= 1 (1-based)");
+    }
+    if x > session.cols {
+        return Response::err(format!(
+            "x coordinate {} exceeds terminal width {}",
+            x, session.cols
+        ));
+    }
+    if y > session.rows {
+        return Response::err(format!(
+            "y coordinate {} exceeds terminal height {}",
+            y, session.rows
+        ));
+    }
+
+    let button_str = button.as_deref().unwrap_or("left");
+    let btn = match mouse::parse_button(button_str) {
+        Ok(b) => b,
+        Err(e) => return Response::err(e),
+    };
+
+    let count = count.unwrap_or(1);
+    if count > 100 {
+        return Response::err("count must be <= 100");
+    }
+    if count == 0 {
+        return Response::err("count must be >= 1");
+    }
+
+    let sequences: Vec<Vec<u8>> = match action.as_str() {
+        "click" => mouse::encode_click(btn, x, y, count),
+        "scroll" => {
+            let dir_str = match direction.as_deref() {
+                Some(d) => d,
+                None => return Response::err("scroll requires --direction (up|down)"),
+            };
+            let dir = match mouse::parse_direction(dir_str) {
+                Ok(d) => d,
+                Err(e) => return Response::err(e),
+            };
+            mouse::encode_scroll(dir, x, y, count)
+        }
+        "press" => vec![mouse::encode_press(btn, x, y)],
+        "release" => vec![mouse::encode_release(btn, x, y)],
+        "move" => vec![mouse::encode_move(btn, x, y)],
+        "drag" => {
+            let tx = match to_x {
+                Some(v) if v >= 1 && v <= session.cols => v,
+                Some(v) if v == 0 => return Response::err("to_x must be >= 1"),
+                Some(v) => {
+                    return Response::err(format!(
+                        "to_x coordinate {} exceeds terminal width {}",
+                        v, session.cols
+                    ))
+                }
+                None => return Response::err("drag requires --to-x"),
+            };
+            let ty = match to_y {
+                Some(v) if v >= 1 && v <= session.rows => v,
+                Some(v) if v == 0 => return Response::err("to_y must be >= 1"),
+                Some(v) => {
+                    return Response::err(format!(
+                        "to_y coordinate {} exceeds terminal height {}",
+                        v, session.rows
+                    ))
+                }
+                None => return Response::err("drag requires --to-y"),
+            };
+            let steps = steps.unwrap_or(5);
+            mouse::encode_drag(btn, x, y, tx, ty, steps)
+        }
+        other => return Response::err(format!("unknown mouse action: '{}'", other)),
+    };
+
+    // Write all sequences to PTY
+    for seq in &sequences {
+        if let Err(e) = session.send_raw_bytes(seq) {
+            return Response::err(e);
+        }
+    }
+
+    Response {
+        ok: true,
+        session_id: Some(session_id),
+        ..Response::ok()
     }
 }
 

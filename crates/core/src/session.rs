@@ -236,6 +236,22 @@ impl Session {
         Ok(())
     }
 
+    /// Send raw bytes to the PTY (no newline appended).
+    pub fn send_raw_bytes(&mut self, data: &[u8]) -> Result<(), String> {
+        let mut writer = self.pty_writer.lock().unwrap();
+        writer
+            .write_all(data)
+            .map_err(|e| format!("write failed: {}", e))?;
+        writer
+            .flush()
+            .map_err(|e| format!("flush failed: {}", e))?;
+        drop(writer);
+        if let Some(ref mut rec) = self.recording {
+            rec.record_in(data);
+        }
+        Ok(())
+    }
+
     /// Send a control character to the PTY.
     pub fn send_ctrl(&mut self, ctrl: &str) -> Result<(), String> {
         let byte = match ctrl {

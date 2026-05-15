@@ -100,6 +100,37 @@ enum Commands {
         #[arg(long)]
         cols: u16,
     },
+    /// Send mouse event to a session
+    Mouse {
+        #[arg(long, short)]
+        session: String,
+        /// Action: click, scroll, press, release, move, drag
+        action: String,
+        /// Column (1-based)
+        #[arg(long)]
+        x: u16,
+        /// Row (1-based)
+        #[arg(long)]
+        y: u16,
+        /// Mouse button: left, middle, right (default: left)
+        #[arg(long, default_value = "left")]
+        button: String,
+        /// Scroll direction: up, down (required for scroll action)
+        #[arg(long)]
+        direction: Option<String>,
+        /// Repeat count for click/scroll (default: 1)
+        #[arg(long)]
+        count: Option<u16>,
+        /// Drag target column (required for drag action)
+        #[arg(long)]
+        to_x: Option<u16>,
+        /// Drag target row (required for drag action)
+        #[arg(long)]
+        to_y: Option<u16>,
+        /// Drag interpolation steps (default: 5)
+        #[arg(long)]
+        steps: Option<u16>,
+    },
     /// Replay a recording file
     Replay {
         file: PathBuf,
@@ -253,6 +284,18 @@ fn command_to_request(cmd: Commands) -> Request {
             writable: if writable { Some(true) } else { None },
         },
         Commands::Resize { session, rows, cols } => Request::Resize { session_id: session, rows, cols },
+        Commands::Mouse { session, action, x, y, button, direction, count, to_x, to_y, steps } => Request::Mouse {
+            session_id: session,
+            action,
+            x,
+            y,
+            button: Some(button),
+            direction,
+            count,
+            to_x,
+            to_y,
+            steps,
+        },
         Commands::Stop => Request::Stop,
         Commands::KillDaemon => unreachable!("KillDaemon is handled locally, never sent via socket"),
         Commands::Replay { .. } => unreachable!(),

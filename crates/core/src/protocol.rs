@@ -68,6 +68,20 @@ pub enum Request {
         cols: u16,
     },
 
+    #[serde(rename = "mouse")]
+    Mouse {
+        session_id: String,
+        action: String,
+        x: u16,
+        y: u16,
+        button: Option<String>,
+        direction: Option<String>,
+        count: Option<u16>,
+        to_x: Option<u16>,
+        to_y: Option<u16>,
+        steps: Option<u16>,
+    },
+
     #[serde(rename = "stop")]
     Stop,
 }
@@ -207,6 +221,35 @@ mod tests {
         let de: Response = serde_json::from_str(&json).unwrap();
         assert!(!de.ok);
         assert_eq!(de.error, Some("timeout".into()));
+    }
+
+    #[test]
+    fn roundtrip_mouse() {
+        let req = Request::Mouse {
+            session_id: "abc".into(),
+            action: "click".into(),
+            x: 10,
+            y: 5,
+            button: Some("left".into()),
+            direction: None,
+            count: Some(2),
+            to_x: None,
+            to_y: None,
+            steps: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let de: Request = serde_json::from_str(&json).unwrap();
+        match de {
+            Request::Mouse { session_id, action, x, y, button, count, .. } => {
+                assert_eq!(session_id, "abc");
+                assert_eq!(action, "click");
+                assert_eq!(x, 10);
+                assert_eq!(y, 5);
+                assert_eq!(button, Some("left".into()));
+                assert_eq!(count, Some(2));
+            }
+            _ => panic!("expected Mouse"),
+        }
     }
 
     #[test]

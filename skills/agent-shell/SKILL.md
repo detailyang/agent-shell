@@ -70,6 +70,22 @@ agent-shell attach [--session ID] [-W]
 
 No `--session` → TUI session picker (↑↓/j/k, Enter, Esc). After handshake, raw binary streaming: keystrokes→PTY, PTY→terminal. Default is **read-only** (Ctrl-C/Ctrl-D exits). `-W` enables writable mode (Ctrl-C detaches, keystrokes forwarded to PTY).
 
+### `mouse` — send mouse event to session
+
+```bash
+agent-shell mouse --session ID ACTION --x COL --y ROW [--button left|middle|right] [--direction up|down] [--count N] [--to-x COL] [--to-y ROW] [--steps N]
+```
+
+Actions: `click`, `scroll`, `press`, `release`, `move`, `drag`. Coordinates are 1-based (col, row). Events encoded as SGR escape sequences (`CSI < ...`). Fire-and-forget — no readiness detection.
+
+- `click` — press + release (default left button). `--count 2` = double-click.
+- `scroll` — requires `--direction up|down`. `--count 3` = 3 scroll events (default 1).
+- `press` / `release` / `move` — atomic primitives for manual drag control.
+- `drag` — press(x,y) → interpolated moves → release(to-x,to-y). `--steps` controls intermediate points (default 5).
+
+→ `{"ok":true,"session_id":"a1b2c3d4"}`
+→ error: `{"ok":false,"error":"x coordinate 81 exceeds terminal width 80"}`
+
 ### `list` / `destroy` / `resize` / `set-prompt` / `stop` / `kill-daemon` / `replay`
 
 ```bash
@@ -112,6 +128,14 @@ agent-shell send --session $SID --nowait "tail -f /var/log/app.log"
 agent-shell wait --session $SID "ERROR" --timeout 60000
 ```
 
+**Mouse interaction with TUI:**
+```bash
+agent-shell send --session $SID --timeout 5000 "vim file.txt"
+agent-shell mouse --session $SID click --x 10 --y 5                 # click at col 10, row 5
+agent-shell mouse --session $SID scroll --x 1 --y 1 --direction down --count 5  # scroll down
+agent-shell mouse --session $SID drag --x 1 --y 3 --to-x 20 --to-y 3  # drag to select text
+```
+
 **Custom env + cwd:**
 ```bash
 agent-shell create --name ci --env NODE_ENV=test --cwd /proj | jq -r .session_id
@@ -126,4 +150,7 @@ agent-shell create --name ci --env NODE_ENV=test --cwd /proj | jq -r .session_id
 - **`destroy` kills the process group.** No orphan processes.
 - **Daemon auto-starts.** First CLI command launches it if needed. `kill-daemon` to force-stop.
 - **Ring buffer is 512 KB.** Old data overwritten when full. Lagging `--client-id` gets `gap:true,lost_bytes:N`.
+- **`mouse` is fire-and-forget.** If the PTY program hasn't enabled mouse mode, sequences are silently ignored.
+- **Mouse coordinates are 1-based** and validated against session cols/rows. Out-of-bounds → error.
+- **Mouse `--count` max is 100.** Prevents accidental flooding.
 - **`AGENT_SHELL_HOME`** overrides base directory (for testing).
