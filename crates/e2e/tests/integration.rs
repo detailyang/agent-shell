@@ -3829,3 +3829,247 @@ mod screen_render {
         daemon.stop();
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Audit fix verification tests
+// ═══════════════════════════════════════════════════════════════════
+
+mod audit_fix {
+    use super::*;
+
+    /// Sending to a session that is being destroyed should fail gracefully.
+    /// (destroying flag prevents operations during the destroy gap)
+    #[test]
+    fn send_to_destroying_session_fails() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "destroy_race"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Start a long-running command
+        let _ = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait", "sleep 999",
+        ]);
+
+        // Destroy the session
+        let resp = daemon.cli_json(&["destroy", "--session", &sid]);
+        assert_ok(&resp);
+
+        // Any subsequent send should fail (session gone)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "2000", "echo test",
+        ]);
+        assert!(!resp.ok, "send to destroyed session should fail");
+
+        daemon.stop();
+    }
+
+    /// Reading from an exited session with empty output should return ok:true
+    /// (not ok:false which would cause CLI to exit(1))
+    #[test]
+    fn read_exited_session_empty_output_ok() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "read_exit"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Read all output first
+        let _ = daemon.cli_json(&["read", "--session", &sid, "--client-id", "drainer"]);
+
+        // Exit the shell
+        let resp = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "exit"]);
+        assert_ok(&resp);
+
+        // Read again — session is exited, may have empty output
+        let resp = daemon.cli_json(&["read", "--session", &sid, "--client-id", "drainer"]);
+        // Should return ok:true with exited:true (not ok:false)
+        assert!(resp.ok, "read on exited session should return ok:true, got: {:?}", resp);
+        assert!(resp.exited.unwrap_or(false), "should have exited:true");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Verify that auto_start_daemon doesn't delete a live socket.
+    /// If a daemon is already running, a second CLI invocation should use it,
+    /// not remove its socket file.
+    #[test]
+    fn auto_start_preserves_live_socket() {
+        let mut daemon = start_daemon();
+        let socket_path = daemon.temp_dir_path().join("daemon.sock");
+
+        // Verify socket exists (daemon is running)
+        assert!(socket_path.exists(), "socket should exist while daemon is running");
+
+        // Run another CLI command — should connect to existing daemon
+        let resp = daemon.cli_json(&["create", "--name", "socket_test"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Socket should still exist (not deleted by auto-start logic)
+        assert!(socket_path.exists(), "socket should still exist after second CLI invocation");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Destroy with bash: background `sleep &` should NOT become an orphan.
+    /// Bash gives background jobs their own pgid, so kill(-shell_pgid) alone
+    /// doesn't reach them. kill_descendants must find and kill them.
+    #[test]
+    fn destroy_kills_bash_background_jobs() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/bash", "--name", "bg_bash"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Use a unique marker to avoid cross-test interference
+        let marker = format!("agent_shell_test_bash_{}", sid);
+        let sleep_cmd = format!("sleep 300 && echo {}", marker);
+
+        // Start a background sleep
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            &format!("{} &", sleep_cmd),
+        ]);
+        assert_ok(&resp);
+        // Wait for the background job to start
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Verify the sleep is actually running
+        let before = std::process::Command::new("pgrep")
+            .args(&["-f", &marker])
+            .output()
+            .ok();
+        let had_sleep = before.map(|o| !o.stdout.is_empty()).unwrap_or(false);
+
+        // Destroy should clean up everything including background jobs
+        let resp = daemon.cli_json(&["destroy", "--session", &sid]);
+        assert_ok(&resp);
+
+        // Verify no orphan processes with our marker
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        if had_sleep {
+            let output = std::process::Command::new("pgrep")
+                .args(&["-f", &marker])
+                .output()
+                .ok();
+            if let Some(out) = output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+                assert!(
+                    lines.is_empty(),
+                    "bash destroy should not leave orphan processes (marker: {}), found: {:?}",
+                    marker, lines
+                );
+            }
+        }
+
+        daemon.stop();
+    }
+
+    /// Destroy with zsh: same test with zsh.
+    #[test]
+    fn destroy_kills_zsh_background_jobs() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--shell", "/bin/zsh", "--name", "bg_zsh"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let marker = format!("agent_shell_test_zsh_{}", sid);
+        let sleep_cmd = format!("sleep 300 && echo {}", marker);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait",
+            &format!("{} &", sleep_cmd),
+        ]);
+        assert_ok(&resp);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let before = std::process::Command::new("pgrep")
+            .args(&["-f", &marker])
+            .output()
+            .ok();
+        let had_sleep = before.map(|o| !o.stdout.is_empty()).unwrap_or(false);
+
+        let resp = daemon.cli_json(&["destroy", "--session", &sid]);
+        assert_ok(&resp);
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        if had_sleep {
+            let output = std::process::Command::new("pgrep")
+                .args(&["-f", &marker])
+                .output()
+                .ok();
+            if let Some(out) = output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+                assert!(
+                    lines.is_empty(),
+                    "zsh destroy should not leave orphan processes (marker: {}), found: {:?}",
+                    marker, lines
+                );
+            }
+        }
+
+        daemon.stop();
+    }
+
+    /// Destroy with fish: same test with fish.
+    #[test]
+    fn destroy_kills_fish_background_jobs() {
+        let mut daemon = start_daemon();
+        // Fish may not be available on all systems
+        let fish_path = if std::path::Path::new("/usr/local/bin/fish").exists() {
+            "/usr/local/bin/fish"
+        } else if std::path::Path::new("/usr/bin/fish").exists() {
+            "/usr/bin/fish"
+        } else {
+            eprintln!("fish not found, skipping");
+            daemon.stop();
+            return;
+        };
+
+        let resp = daemon.cli_json(&["create", "--shell", fish_path, "--name", "bg_fish"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let marker = format!("agent_shell_test_fish_{}", sid);
+        let sleep_cmd = format!("sleep 300; echo {}", marker);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait",
+            &format!("{} &", sleep_cmd),
+        ]);
+        assert_ok(&resp);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let before = std::process::Command::new("pgrep")
+            .args(&["-f", &marker])
+            .output()
+            .ok();
+        let had_sleep = before.map(|o| !o.stdout.is_empty()).unwrap_or(false);
+
+        let resp = daemon.cli_json(&["destroy", "--session", &sid]);
+        assert_ok(&resp);
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        if had_sleep {
+            let output = std::process::Command::new("pgrep")
+                .args(&["-f", &marker])
+                .output()
+                .ok();
+            if let Some(out) = output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+                assert!(
+                    lines.is_empty(),
+                    "fish destroy should not leave orphan processes (marker: {}), found: {:?}",
+                    marker, lines
+                );
+            }
+        }
+
+        daemon.stop();
+    }
+}

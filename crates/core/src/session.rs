@@ -30,6 +30,8 @@ pub struct Session {
     pub prompt_regex: Option<Regex>,
     pub child_pid: u32,
     pub exited: Option<i32>,
+    /// True once destroy has started — other operations should reject.
+    pub destroying: bool,
     pub created_at: u64,  // Unix timestamp in seconds
     pub created_at_instant: Instant,  // For elapsed time calculations
     pub cwd: Option<PathBuf>,
@@ -168,6 +170,7 @@ impl Session {
             prompt_regex,
             child_pid,
             exited: None,
+            destroying: false,
             created_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -312,19 +315,77 @@ impl Session {
         self.current_fg_pgid == self.shell_pgid && self.prev_fg_pgid != self.shell_pgid
     }
 
-    /// Kill the child process with SIGHUP.
+    /// Kill the child process group with SIGHUP.
+    /// Also attempts to kill all descendant process groups by scanning
+    /// child processes of the shell.
     pub fn kill(&mut self) {
+        // Send SIGHUP to the process group (negative pgid = kill whole group)
+        // Guard against pgid <= 0: kill(0) signals all processes in the caller's group.
+        if self.shell_pgid > 0 {
+            let _ = signal::kill(
+                nix::unistd::Pid::from_raw(-self.shell_pgid),
+                Signal::SIGHUP,
+            );
+        }
+        // Also send to child directly as fallback
         let _ = signal::kill(
             nix::unistd::Pid::from_raw(self.child_pid as i32),
             Signal::SIGHUP,
         );
+        // Kill descendant process groups (background jobs in bash/zsh/fish
+        // create their own pgid, so kill(-shell_pgid) misses them).
+        // We scan for children of the shell process and kill their process groups.
+        self.kill_descendants(Signal::SIGHUP);
     }
 
-    /// Force kill the child process with SIGKILL, then reap the zombie.
+    /// Force kill the child process group with SIGKILL, then reap the zombie.
     pub fn force_kill(&mut self) {
+        // SIGKILL the whole process group
+        // Guard against pgid <= 0: kill(0) signals all processes in the caller's group.
+        if self.shell_pgid > 0 {
+            let _ = signal::kill(
+                nix::unistd::Pid::from_raw(-self.shell_pgid),
+                Signal::SIGKILL,
+            );
+        }
+        // Kill descendant process groups with SIGKILL too
+        self.kill_descendants(Signal::SIGKILL);
+        // Also use portable-pty's killer (ensures reap via waitpid)
         let _ = self.child_killer.kill();
         // Reap zombie immediately
         let _ = self.child.try_wait();
+    }
+
+    /// Kill all descendant process groups of the shell process.
+    /// Background jobs in bash/zsh/fish get their own process group ID
+    /// (pgid = child_pid of the background command), so kill(-shell_pgid)
+    /// doesn't reach them. This scans /proc (Linux) or uses ps (macOS)
+    /// to find children and kills their process groups.
+    fn kill_descendants(&self, sig: Signal) {
+        // Find all PIDs whose parent is our child_pid, then kill their pgids.
+        // Use pgrep -P <pid> to find children (works on macOS and Linux).
+        let output = std::process::Command::new("pgrep")
+            .args([&format!("-P{}", self.child_pid)])
+            .output();
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if let Ok(child_pid) = line.trim().parse::<i32>() {
+                    if child_pid > 0 {
+                        // Kill the child's process group
+                        let _ = signal::kill(
+                            nix::unistd::Pid::from_raw(-child_pid),
+                            sig,
+                        );
+                        // Also kill the child directly
+                        let _ = signal::kill(
+                            nix::unistd::Pid::from_raw(child_pid),
+                            sig,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Resize the PTY.

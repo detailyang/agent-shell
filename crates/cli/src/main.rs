@@ -254,7 +254,7 @@ fn command_to_request(cmd: Commands) -> Request {
         },
         Commands::Resize { session, rows, cols } => Request::Resize { session_id: session, rows, cols },
         Commands::Stop => Request::Stop,
-        Commands::KillDaemon => Request::Stop, // handled locally, never sent
+        Commands::KillDaemon => unreachable!("KillDaemon is handled locally, never sent via socket"),
         Commands::Replay { .. } => unreachable!(),
     }
 }
@@ -276,6 +276,9 @@ async fn connect_and_send(socket_path: &PathBuf, cmd: &Commands) -> Result<Respo
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.map_err(|e| format!("read: {}", e))?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 16 * 1024 * 1024 {
+        return Err("response too large".into());
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await.map_err(|e| format!("read: {}", e))?;
 
@@ -310,6 +313,9 @@ async fn fetch_sessions(socket_path: &PathBuf) -> Result<Vec<agent_shell_core::p
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.map_err(|e| format!("read: {}", e))?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 16 * 1024 * 1024 {
+        return Err("response too large".into());
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await.map_err(|e| format!("read: {}", e))?;
 
@@ -423,6 +429,9 @@ async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.map_err(|e| format!("read handshake: {}", e))?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 16 * 1024 * 1024 {
+        return Err("handshake response too large".into());
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await.map_err(|e| format!("read handshake: {}", e))?;
     let resp: Response = serde_json::from_slice(&buf).map_err(|e| format!("parse handshake: {}", e))?;
@@ -531,7 +540,12 @@ async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
 // ─── Daemon auto-start ───────────────────────────────────────────────
 
 async fn auto_start_daemon(socket_path: &PathBuf) -> Result<(), String> {
+    // Try connecting first — another daemon may already be running
     if socket_path.exists() {
+        if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
+            return Ok(()); // daemon is running, just use it
+        }
+        // Socket file exists but no daemon — stale artifact, safe to remove
         let _ = std::fs::remove_file(socket_path);
     }
     let daemon_bin = find_daemon_binary()?;

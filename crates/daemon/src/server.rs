@@ -152,6 +152,13 @@ async fn handle_connection(mut stream: tokio::net::UnixStream, state: Arc<Mutex<
         return;
     }
 
+    // Handle stop: send OK response, then shut down
+    if let Request::Stop = req {
+        send_response(&mut stream, &Response::ok()).await;
+        handle_stop(state).await; // does not return
+        unreachable!()
+    }
+
     let resp = handle_request(req, state).await;
     send_response(&mut stream, &resp).await;
 }
@@ -220,8 +227,7 @@ async fn handle_request(req: Request, state: Arc<Mutex<AppState>>) -> Response {
             cols,
         } => handle_resize(state, session_id, rows, cols).await,
 
-        Request::Stop => handle_stop(state).await,
-
+        Request::Stop => unreachable!("Stop is handled in handle_connection"),
         Request::Attach { .. } => unreachable!(),
     }
 }
@@ -245,22 +251,34 @@ async fn handle_create(
     }
 
     match Session::new(&config, name, shell, cwd, env, prompt, rows, cols, buffer_size, record) {
-        Ok(mut session) => {
+        Ok(session) => {
             let id = session.id.clone();
             let recording_path = session.recording.as_ref().map(|_| {
                 config.recording_dir().join(format!("{}.jsonl", id)).to_string_lossy().to_string()
             });
 
-            // Set PTY reader to non-blocking
-            set_nonblocking(session.master_fd());
+            // Set PTY reader to non-blocking BEFORE inserting into map
+            if let Err(e) = set_nonblocking(session.master_fd()) {
+                eprintln!("warning: failed to set PTY non-blocking: {}", e);
+                // Non-fatal: feed() will still work, just may block briefly
+            }
 
-            // Wait briefly for shell to start
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            session.feed();
-            session.check_fg_pgid();
-
+            // Insert session into map first so daemon shutdown can find it.
+            // Then wait briefly for shell to start.
             let mut s = state.lock().await;
             s.sessions.insert(id.clone(), session);
+
+            // Wait for shell to initialize while holding the lock.
+            // This is safe because the lock is only held briefly and
+            // other handlers will wait. It ensures the session is
+            // visible to shutdown/reaper during this window.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            // Now feed and check pgid
+            if let Some(session) = s.sessions.get_mut(&id) {
+                session.feed();
+                session.check_fg_pgid();
+            }
 
             Response {
                 ok: true,
@@ -275,23 +293,29 @@ async fn handle_create(
 }
 
 /// Set a file descriptor to non-blocking mode.
-fn set_nonblocking(fd: Option<std::os::unix::io::RawFd>) {
+/// Returns error string on failure so callers can decide whether to proceed.
+fn set_nonblocking(fd: Option<std::os::unix::io::RawFd>) -> Result<(), String> {
     if let Some(fd) = fd {
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags >= 0 {
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            if flags < 0 {
+                return Err(format!("fcntl F_GETFL failed for fd {}: {}", fd, std::io::Error::last_os_error()));
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(format!("fcntl F_SETFL failed for fd {}: {}", fd, std::io::Error::last_os_error()));
             }
         }
     }
+    Ok(())
 }
 
 async fn handle_destroy(state: Arc<Mutex<AppState>>, session_id: String) -> Response {
-    // Step 1: kill + close recording under lock
+    // Step 1: mark destroying + kill + close recording under lock
     {
         let mut s = state.lock().await;
         match s.sessions.get_mut(&session_id) {
             Some(session) => {
+                session.destroying = true;
                 session.kill();
                 session.close_recording();
             }
@@ -340,6 +364,10 @@ async fn handle_send(
             None => return Response::err("session not found"),
         };
 
+        if session.destroying {
+            return Response::err("session is being destroyed");
+        }
+
         if let Some(exit_code) = session.exited {
             return Response {
                 ok: false,
@@ -353,6 +381,9 @@ async fn handle_send(
         write_cursor_before = session.ringbuf.write_cursor();
 
         if let Some(ref ctrl) = ctrl {
+            if !text.is_empty() {
+                return Response::err("cannot specify both --ctrl and text");
+            }
             if let Err(e) = session.send_ctrl(ctrl) {
                 return Response::err(e);
             }
@@ -417,6 +448,16 @@ async fn handle_send(
     // Phase 2: Wait for fg_pgid to return to shell, or prompt match, or exit.
     // For very fast commands that complete before Phase 1 timeout, we use output
     // stabilization (no new output for 150ms while fg_at_shell).
+    //
+    // Track overflow per-send. take_overflow() resets the flag,
+    // so any overflow detected in the loop must have happened during this send.
+    {
+        let mut s = state.lock().await;
+        if let Some(session) = s.sessions.get_mut(&session_id) {
+            let _ = session.ringbuf.take_overflow(); // clear any pre-existing overflow
+        }
+    }
+
     let deadline = start + std::time::Duration::from_millis(timeout_ms);
     let mut stable_since: Option<std::time::Instant> = None;
     let mut last_wc = write_cursor_before;
@@ -617,14 +658,6 @@ async fn handle_read(
 
     if let Some(exit_code) = session.exited {
         let (output, gap, lost_bytes) = read_from_cursor(&mut s, &session_id, &client_id);
-        if output.is_empty() {
-            return Response {
-                ok: false,
-                error: Some("session exited".into()),
-                exit_code: Some(exit_code),
-                ..Response::ok()
-            };
-        }
         let mut resp = Response {
             ok: true,
             output: Some(String::from_utf8_lossy(&output).to_string()),
@@ -847,7 +880,7 @@ async fn handle_resize(
     }
 }
 
-async fn handle_stop(state: Arc<Mutex<AppState>>) -> Response {
+async fn handle_stop(state: Arc<Mutex<AppState>>) {
     // Step 1: kill all sessions under lock
     {
         let mut s = state.lock().await;
@@ -869,12 +902,43 @@ async fn handle_stop(state: Arc<Mutex<AppState>>) -> Response {
         s.sessions.clear(); // Drop all sessions -> Session::drop -> try_wait
     }
 
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        std::process::exit(0);
-    });
+    // Clean up and exit directly (no response needed — we're shutting down)
+    let socket_path = Config::base_dir().join("daemon.sock");
+    let pid_path = Config::base_dir().join("daemon.pid");
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&pid_path);
 
-    Response::ok()
+    // Give the response a brief moment to be sent, then exit.
+    // The response was already written by send_response before this was called.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    std::process::exit(0);
+}
+
+/// Event from a read-with-timeout operation.
+enum StreamEvent<'a> {
+    Data(&'a [u8]),
+    Eof,
+    Timeout,
+}
+
+/// Read from stream_rx with a timeout. Used in readonly attach mode
+/// where we need to simultaneously wait for both daemon output (via
+/// ringbuf poll) and stdin exit keys.
+async fn stdin_read_with_timeout<'a>(
+    stream_rx: &mut tokio::net::unix::OwnedReadHalf,
+    buf: &'a mut [u8],
+    timeout: std::time::Duration,
+) -> StreamEvent<'a> {
+    tokio::select! {
+        result = stream_rx.read(buf) => {
+            match result {
+                Ok(0) => StreamEvent::Eof,
+                Ok(n) => StreamEvent::Data(&buf[..n]),
+                Err(_) => StreamEvent::Eof,
+            }
+        }
+        _ = tokio::time::sleep(timeout) => StreamEvent::Timeout,
+    }
 }
 
 async fn handle_attach(
@@ -887,7 +951,7 @@ async fn handle_attach(
     // Instead of using VteGrid full_redraw (which strips colors/attributes),
     // we transmit the raw PTY output bytes from the ring buffer.
     // The client's real terminal will interpret the escape sequences correctly.
-    let (raw_output, start_cursor, pty_fd) = {
+    let (raw_output, start_cursor) = {
         let mut s = state.lock().await;
         let session = match s.sessions.get_mut(&session_id) {
             Some(s) => s,
@@ -900,13 +964,14 @@ async fn handle_attach(
             send_response(&mut stream, &Response::err("session exited")).await;
             return;
         }
+        if session.destroying {
+            send_response(&mut stream, &Response::err("session is being destroyed")).await;
+            return;
+        }
         session.feed();
         let wc = session.ringbuf.write_cursor();
-        // Read all available raw PTY output from the ringbuf
-        // (this includes VT100 escape sequences for colors, cursor movement, etc.)
         let (raw_bytes, _gap, _lost) = session.ringbuf.read(0);
-        let fd = session.master_fd();
-        (raw_bytes, wc, fd)
+        (raw_bytes, wc)
     };
 
     // JSON response carries the raw PTY output.
@@ -923,21 +988,12 @@ async fn handle_attach(
     send_response(&mut stream, &init_resp).await;
 
     // ── Phase 2: raw binary bidirectional streaming ─────────────────────
-    // Use AsyncFd for event-driven PTY reads (no polling latency).
-    // AsyncFd registers the PTY master fd with tokio's epoll/kqueue.
-    struct BorrowedFd(std::os::unix::io::RawFd);
-    impl std::os::unix::io::AsRawFd for BorrowedFd {
-        fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0 }
-    }
-    // BorrowedFd does NOT close the fd on drop — the Session owns it.
-    impl Drop for BorrowedFd {
-        fn drop(&mut self) {}
-    }
-
-    let async_fd = match pty_fd {
-        Some(fd) => tokio::io::unix::AsyncFd::new(BorrowedFd(fd)).ok(),
-        None => None,
-    };
+    // We do NOT use AsyncFd on the PTY master fd. The PTY fd lifetime is
+    // tied to the Session, and if the session is destroyed while attach is
+    // running, the fd could be closed/reused under us. Instead, we poll the
+    // ringbuf at 50ms intervals. The reaper task and send handler call feed()
+    // to drain PTY output into the ringbuf; we just read from there.
+    // This eliminates the fd reuse race entirely.
 
     let (mut stream_rx, mut stream_tx) = stream.into_split();
     let mut pty_cursor = start_cursor;
@@ -947,98 +1003,71 @@ async fn handle_attach(
         let mut stdin_buf = [0u8; 4096];
 
         if readonly {
-            // ── readonly: wait for PTY data or periodic ringbuf check ──
-            // We must periodically check the ringbuf even when the PTY fd
-            // isn't readable, because `send` may have already drained the
-            // PTY output into the ringbuf via feed().
-            if let Some(ref async_fd) = async_fd {
-                tokio::select! {
-                    result = async_fd.readable() => {
-                        match result {
-                            Ok(mut guard) => { guard.clear_ready(); }
-                            Err(_) => { running = false; continue; }
+            // ── readonly: wait for ringbuf data or stdin exit key ──
+            tokio::select! {
+                // stdin → check for exit keys only
+                result = stdin_read_with_timeout(&mut stream_rx, &mut stdin_buf, std::time::Duration::from_millis(50)) => {
+                    match result {
+                        StreamEvent::Data(data) => {
+                            // Ctrl-C or Ctrl-D exits readonly attach
+                            if data.contains(&0x03) || data.contains(&0x04) {
+                                running = false;
+                            }
+                        }
+                        StreamEvent::Eof => running = false,
+                        StreamEvent::Timeout => {
+                            // Periodic ringbuf drain — send/reaper already feed() into ringbuf
                         }
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                        // Periodic ringbuf check — ensures we pick up data
-                        // that was already drained from the PTY by send/read handlers.
-                    }
                 }
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         } else {
-            // ── rw: select between client-stdin and PTY-readiness ──
-            if let Some(ref async_fd) = async_fd {
-                tokio::select! {
-                    // client keystroke → PTY
-                    result = stream_rx.read(&mut stdin_buf) => {
-                        match result {
-                            Ok(0) => { running = false; continue; }
-                            Ok(n) => {
-                                let data = &stdin_buf[..n];
-                                let mut s = state.lock().await;
-                                if let Some(session) = s.sessions.get_mut(&session_id) {
-                                    if let Some(ref mut writer) = session.pty_writer.lock().ok() {
-                                        let _ = writer.write_all(data);
-                                        let _ = writer.flush();
-                                    }
-                                    if let Some(ref mut rec) = session.recording {
-                                        rec.record_in(data);
-                                    }
-                                } else {
-                                    running = false;
-                                }
+            // ── rw: select between client-stdin and ringbuf-poll ──
+            tokio::select! {
+                // client keystroke → PTY
+                result = stream_rx.read(&mut stdin_buf) => {
+                    match result {
+                        Ok(0) => { running = false; continue; }
+                        Ok(n) => {
+                            let data = &stdin_buf[..n];
+                            // Ctrl-C (0x03) detaches without forwarding to PTY
+                            if data.contains(&0x03) {
+                                running = false;
+                                continue;
                             }
-                            Err(_) => { running = false; continue; }
-                        }
-                    }
-                    // PTY fd became readable
-                    result = async_fd.readable() => {
-                        match result {
-                            Ok(mut guard) => { guard.clear_ready(); }
-                            Err(_) => { running = false; continue; }
-                        }
-                    }
-                    // Periodic ringbuf check (same reason as readonly)
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                }
-            } else {
-                // Fallback: no raw fd available, poll at 5ms
-                tokio::select! {
-                    result = stream_rx.read(&mut stdin_buf) => {
-                        match result {
-                            Ok(0) => { running = false; continue; }
-                            Ok(n) => {
-                                let data = &stdin_buf[..n];
-                                let mut s = state.lock().await;
-                                if let Some(session) = s.sessions.get_mut(&session_id) {
-                                    if let Some(ref mut writer) = session.pty_writer.lock().ok() {
-                                        let _ = writer.write_all(data);
-                                        let _ = writer.flush();
-                                    }
-                                    if let Some(ref mut rec) = session.recording {
-                                        rec.record_in(data);
-                                    }
-                                } else {
+                            let mut s = state.lock().await;
+                            if let Some(session) = s.sessions.get_mut(&session_id) {
+                                if session.destroying {
                                     running = false;
+                                    continue;
                                 }
+                                if let Some(ref mut writer) = session.pty_writer.lock().ok() {
+                                    let _ = writer.write_all(data);
+                                    let _ = writer.flush();
+                                }
+                                if let Some(ref mut rec) = session.recording {
+                                    rec.record_in(data);
+                                }
+                            } else {
+                                running = false;
                             }
-                            Err(_) => { running = false; continue; }
                         }
+                        Err(_) => { running = false; continue; }
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
                 }
+                // Periodic ringbuf check
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
             }
         }
 
-        // ── drain PTY output → client ──
+        // ── drain ringbuf output → client ──
         let (data, exited, gone) = {
             let mut s = state.lock().await;
             match s.sessions.get_mut(&session_id) {
                 Some(session) => {
-                    let exited = session.exited.is_some();
+                    // Feed PTY→ringbuf ourselves in case no one else did
                     session.feed();
+                    let exited = session.exited.is_some();
                     let wc = session.ringbuf.write_cursor();
                     let data = if wc > pty_cursor {
                         let (d, _, _) = session.ringbuf.read(pty_cursor);
@@ -1058,7 +1087,7 @@ async fn handle_attach(
                 break;
             }
         }
-        if exited || gone {
+        if gone || exited {
             running = false;
         }
     }
