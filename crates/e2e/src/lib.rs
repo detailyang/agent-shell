@@ -22,6 +22,26 @@ impl DaemonHandle {
     }
 
     /// Execute a CLI command and parse the response as JSON.
+    /// Send a raw Request to the daemon over the Unix socket and return the Response.
+    /// Used when the CLI argument format doesn't support the needed parameters
+    /// (e.g. passing an explicit argv like `["vim", "/path/to/file"]`).
+    pub fn rpc(&self, req: &Request) -> Response {
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .expect("rpc: connect to daemon socket");
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let data = serde_json::to_vec(req).expect("rpc: serialize request");
+        let len = data.len() as u32;
+        stream.write_all(&len.to_be_bytes()).expect("rpc: write len");
+        stream.write_all(&data).expect("rpc: write data");
+        let mut lb = [0u8; 4];
+        stream.read_exact(&mut lb).expect("rpc: read resp len");
+        let rlen = u32::from_be_bytes(lb) as usize;
+        let mut buf = vec![0u8; rlen];
+        stream.read_exact(&mut buf).expect("rpc: read resp body");
+        serde_json::from_slice(&buf).expect("rpc: parse response")
+    }
+
     pub fn cli_json(&self, args: &[&str]) -> Response {
         let output = self.cli(args);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -135,6 +155,61 @@ impl AttachConnection {
             }
         }
         output
+    }
+
+    /// Send raw bytes and wait until any response bytes arrive (or timeout).
+    /// Returns all bytes received within the timeout window.
+    pub fn send_and_read(&mut self, data: &[u8], timeout: Duration) -> Vec<u8> {
+        self.send(data).ok();
+        // Small yield so the PTY has time to process the input.
+        std::thread::sleep(Duration::from_millis(30));
+        self.read_output(timeout)
+    }
+
+    /// Find the last CSI cursor-position sequence `ESC[row;colH` in a byte slice.
+    /// Returns `(row, col)` (1-based) or `None`.
+    pub fn last_cursor_pos(bytes: &[u8]) -> Option<(usize, usize)> {
+        // Walk backwards looking for ESC [ ... H
+        let mut i = bytes.len().saturating_sub(1);
+        loop {
+            if i + 2 >= bytes.len() {
+                if i == 0 { return None; }
+                i -= 1;
+                continue;
+            }
+            if bytes[i] == b'\x1b' && bytes[i + 1] == b'[' {
+                // scan for terminator
+                let mut j = i + 2;
+                while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'H' {
+                    let inner = std::str::from_utf8(&bytes[i+2..j]).unwrap_or("");
+                    let mut parts = inner.split(';');
+                    let row: usize = parts.next().unwrap_or("1").parse().unwrap_or(1);
+                    let col: usize = parts.next().unwrap_or("1").parse().unwrap_or(1);
+                    return Some((row, col));
+                }
+            }
+            if i == 0 { return None; }
+            i -= 1;
+        }
+    }
+
+    /// Collect output until `predicate` returns true or `timeout` elapses.
+    /// Returns the full accumulated output.
+    pub fn wait_for<F>(&mut self, timeout: Duration, predicate: F) -> Vec<u8>
+    where F: Fn(&[u8]) -> bool
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut all = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let chunk = self.read_output(remaining.min(Duration::from_millis(50)));
+            all.extend_from_slice(&chunk);
+            if predicate(&all) { break; }
+        }
+        all
     }
 
     /// Send a command and wait for output containing the expected text.

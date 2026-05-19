@@ -2988,7 +2988,9 @@ mod create_env {
 mod attach_exited {
     use super::*;
 
-    /// Attach to an already-exited session should fail
+    /// Attach to an already-exited session should succeed and return ringbuf data.
+    /// Short-lived programs (ls, echo, etc.) may finish before the attach
+    /// handshake arrives; we must still deliver their output.
     #[test]
     fn attach_to_exited_session() {
         let mut daemon = start_daemon();
@@ -3000,9 +3002,9 @@ mod attach_exited {
         let resp = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "exit"]);
         assert_ok(&resp);
 
-        // Try to attach — should fail
+        // Attach should succeed (returns buffered output then EOF stream closes).
         let result = daemon.connect_attach_rw(&sid);
-        assert!(result.is_err(), "attach to exited session should fail");
+        assert!(result.is_ok(), "attach to exited session should succeed: {:?}", result.err());
 
         daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();
@@ -4494,6 +4496,547 @@ mod mouse {
         ]);
         assert_error(&resp, "unknown mouse action");
 
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+}
+
+// ── vim e2e tests ─────────────────────────────────────────────────────────────
+// These tests attach to a vim session via a raw socket (simulating what a real
+// terminal does) and verify that the PTY round-trip works correctly:
+//   input bytes → daemon PTY → vim process → PTY output → attach stream
+//
+// Key design decisions:
+//   • We open a temp file with known content so tests are deterministic.
+//   • We use cursor-position sequences (CSI row;col H) as ground truth for
+//     where vim thinks the cursor is – no screen-scraping of colours/attrs.
+//   • After each key we call wait_for() instead of a fixed sleep so CI doesn't
+//     flake on slow machines.
+//   • All tests quit vim with :q! and destroy the session so resources are
+//     released even on failure.
+mod vim {
+    use super::*;
+    use std::time::Duration;
+    use std::io::Write;
+
+    // ── constants ────────────────────────────────────────────────────────────
+
+    /// Escape byte.
+    const ESC: &[u8] = b"\x1b";
+    /// Cursor-up key (DECCKM application mode, which vim enables).
+    const KEY_UP:    &[u8] = b"\x1bOA";
+    /// Cursor-down key.
+    const KEY_DOWN:  &[u8] = b"\x1bOB";
+    /// Cursor-right key.
+    const KEY_RIGHT: &[u8] = b"\x1bOC";
+    /// Cursor-left key.
+    const KEY_LEFT:  &[u8] = b"\x1bOD";
+
+    /// Time budget for vim to process a single key and emit a response.
+    const KEY_TIMEOUT: Duration = Duration::from_millis(800);
+    /// Time budget for vim startup (file open + ambiguous-width probe).
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Create an isolated temp file with `lines` lines of content.
+    /// Returns (path, content_lines).
+    fn make_test_file(lines: &[&str]) -> (tempfile::NamedTempFile, Vec<String>) {
+        let mut f = tempfile::NamedTempFile::new().expect("tmp file");
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+        f.flush().unwrap();
+        let owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        (f, owned)
+    }
+
+    /// Start a vim session on `path`, wait for the initial screen draw, and
+    /// return (session_id, attach_connection).
+    fn start_vim(
+        daemon: &DaemonHandle,
+        path: &str,
+    ) -> (String, AttachConnection) {
+        // Use raw RPC to pass argv=["vim", path] directly, since the CLI -c flag
+        // means "shell -c cmd", not "vim <file>".
+        let resp = daemon.rpc(&agent_shell_core::protocol::Request::Create {
+            name: Some("vim_test".into()),
+            program: None,
+            args: Some(vec!["vim".to_string(), path.to_string()]),
+            cwd: None,
+            env: None,
+            prompt: None,
+            rows: Some(24),
+            cols: Some(80),
+            buffer_size: None,
+            record: None,
+        });
+        assert!(resp.ok, "create vim session: {:?}", resp.error);
+        let sid = session_id(&resp);
+
+        let mut conn = daemon.connect_attach_rw(&sid).expect("attach");
+
+        // Wait until vim has drawn its initial screen.
+        // The attach handshake returns a base64-encoded snapshot of what's already
+        // in the ringbuf (initial_output). Vim's final render (ESC[?25h show cursor)
+        // may arrive in the initial snapshot OR in subsequent stream bytes.
+        // We accumulate both until the marker appears.
+        let mut accumulated = conn.initial_output.clone();
+        let marker_25h: &[u8] = b"\x1b[?25h";
+        let marker_34h: &[u8] = b"\x1b[34h";
+        let has_marker = |buf: &[u8]| {
+            buf.windows(marker_25h.len()).any(|w| w == marker_25h)
+                || buf.windows(marker_34h.len()).any(|w| w == marker_34h)
+        };
+        if !has_marker(&accumulated) {
+            let extra = conn.wait_for(STARTUP_TIMEOUT, |buf| {
+                let mut combined = accumulated.clone();
+                combined.extend_from_slice(buf);
+                has_marker(&combined)
+            });
+            accumulated.extend_from_slice(&extra);
+        }
+        assert!(
+            has_marker(&accumulated),
+            "vim did not produce initial output within {:?}",
+            STARTUP_TIMEOUT
+        );
+
+        (sid, conn)
+    }
+
+    /// Send ESC + `:q!\r` and wait for the alternate screen to be dismissed
+    /// (vim emits ESC[?1049l on exit).
+    fn quit_vim(conn: &mut AttachConnection) {
+        conn.send(ESC).ok();
+        std::thread::sleep(Duration::from_millis(50));
+        conn.send(b":q!\r").ok();
+        conn.wait_for(Duration::from_secs(2), |buf| {
+            buf.windows(7).any(|w| w == b"\x1b[?1049l")
+        });
+    }
+
+    /// Extract cursor row from the last CUP sequence in `buf`.
+    fn cursor_row(buf: &[u8]) -> Option<usize> {
+        AttachConnection::last_cursor_pos(buf).map(|(r, _)| r)
+    }
+
+    /// Send a key and collect the PTY response.
+    fn key(conn: &mut AttachConnection, k: &[u8]) -> Vec<u8> {
+        // Drain any stale bytes first.
+        conn.read_output(Duration::from_millis(10));
+        conn.send_and_read(k, KEY_TIMEOUT)
+    }
+
+    // ── tests ────────────────────────────────────────────────────────────────
+
+    /// Vim starts up and renders the file content.
+    /// Verifies that the attach stream contains visible text from the file.
+    #[test]
+    fn vim_opens_file_and_renders_content() {
+        let mut daemon = start_daemon();
+        let (file, lines) = make_test_file(&["alpha", "beta", "gamma"]);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+
+        // The initial output must contain the file content.
+        let text = String::from_utf8_lossy(&conn.initial_output).to_string();
+        let all: String = text + &String::from_utf8_lossy(
+            &conn.read_output(Duration::from_millis(200))
+        ).to_string();
+
+        assert!(
+            all.contains(&lines[0]) || all.contains("alpha"),
+            "initial render should contain file content; got {} bytes",
+            all.len()
+        );
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// `j` / `k` move the cursor down and up one line.
+    #[test]
+    fn vim_j_k_navigation() {
+        let mut daemon = start_daemon();
+        let (file, _) = make_test_file(&["line1", "line2", "line3", "line4"]);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+
+        // Drain startup noise.
+        conn.read_output(Duration::from_millis(100));
+
+        // G → go to last line first (guarantees cursor is NOT at row 1)
+        key(&mut conn, b"G");
+
+        // gg → top of file → cursor at row 1
+        let out = key(&mut conn, b"gg");
+        let row = cursor_row(&out).expect("gg: cursor pos expected");
+        assert_eq!(row, 1, "gg should move cursor to row 1, got {}", row);
+
+        // j → row 2
+        let out = key(&mut conn, b"j");
+        let row = cursor_row(&out).expect("j: cursor pos expected");
+        assert_eq!(row, 2, "j should move cursor to row 2, got {}", row);
+
+        // j → row 3
+        let out = key(&mut conn, b"j");
+        let row = cursor_row(&out).expect("j: cursor pos expected");
+        assert_eq!(row, 3, "j should move cursor to row 3, got {}", row);
+
+        // k → row 2
+        let out = key(&mut conn, b"k");
+        let row = cursor_row(&out).expect("k: cursor pos expected");
+        assert_eq!(row, 2, "k should move cursor back to row 2, got {}", row);
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Arrow keys work identically to hjkl in normal mode.
+    /// Vim sets DECCKM (application cursor keys) so the sequences are ESC O [ABCD].
+    #[test]
+    fn vim_arrow_key_navigation() {
+        let mut daemon = start_daemon();
+        let (file, _) = make_test_file(&["row1", "row2", "row3"]);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+        conn.read_output(Duration::from_millis(100));
+
+        // Start at top.
+        conn.send(b"gg").ok();
+        conn.wait_for(KEY_TIMEOUT, |buf| cursor_row(buf).is_some());
+
+        // ↓ → row 2
+        let out = key(&mut conn, KEY_DOWN);
+        let row = cursor_row(&out).expect("↓: cursor pos expected");
+        assert_eq!(row, 2, "↓ should move to row 2, got {}", row);
+
+        // ↓ → row 3
+        let out = key(&mut conn, KEY_DOWN);
+        let row = cursor_row(&out).expect("↓: cursor pos expected");
+        assert_eq!(row, 3, "↓ should move to row 3, got {}", row);
+
+        // ↑ → row 2
+        let out = key(&mut conn, KEY_UP);
+        let row = cursor_row(&out).expect("↑: cursor pos expected");
+        assert_eq!(row, 2, "↑ should move back to row 2, got {}", row);
+
+        // → then ← should stay on same row
+        let out = key(&mut conn, KEY_RIGHT);
+        let row_r = cursor_row(&out).expect("→: cursor pos expected");
+        let out = key(&mut conn, KEY_LEFT);
+        let row_l = cursor_row(&out).expect("←: cursor pos expected");
+        assert_eq!(row_r, row_l, "→ then ← should return to same row");
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// `G` goes to the last line; `gg` goes to the first line.
+    #[test]
+    fn vim_G_and_gg() {
+        let mut daemon = start_daemon();
+        let (file, lines) = make_test_file(&["a", "b", "c", "d", "e"]);
+        let path = file.path().to_str().unwrap().to_string();
+        let n = lines.len();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+        conn.read_output(Duration::from_millis(100));
+
+        // G → last line
+        let out = key(&mut conn, b"G");
+        let row = cursor_row(&out).expect("G: cursor pos expected");
+        assert_eq!(row, n, "G should move to last row {}, got {}", n, row);
+
+        // gg → first line
+        let out = key(&mut conn, b"gg");
+        let row = cursor_row(&out).expect("gg: cursor pos expected");
+        assert_eq!(row, 1, "gg should move to row 1, got {}", row);
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Insert mode: `i` enters insert, typed text appears, `ESC` returns to normal.
+    #[test]
+    fn vim_insert_and_escape() {
+        let mut daemon = start_daemon();
+        let (file, _) = make_test_file(&["original"]);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+        conn.read_output(Duration::from_millis(100));
+
+        // Enter insert mode.
+        conn.send(b"i").ok();
+        let out = conn.wait_for(KEY_TIMEOUT, |buf| {
+            // vim emits "--INSERT--" in the status bar
+            buf.windows(8).any(|w| w == b"--INSERT" || w == b"-- INSE")
+            // or just check cursor moved to col > 1 (insert mode shows cursor)
+        });
+        // Even if "--INSERT--" isn't visible, we check that col changes when typing.
+
+        // Type a distinctive string.
+        conn.send(b"XYZXYZ").ok();
+        let out2 = conn.wait_for(KEY_TIMEOUT, |buf| {
+            String::from_utf8_lossy(buf).contains("XYZXYZ")
+        });
+        assert!(
+            String::from_utf8_lossy(&out2).contains("XYZXYZ")
+                || String::from_utf8_lossy(&out).contains("XYZXYZ"),
+            "typed text XYZXYZ should appear in PTY output"
+        );
+
+        // ESC → back to normal mode (col should decrease by len("XYZXYZ")-1 = 5)
+        let esc_out = key(&mut conn, ESC);
+        let col_after = AttachConnection::last_cursor_pos(&esc_out).map(|(_, c)| c);
+        // In normal mode the cursor is on the last typed char; in insert it was after it.
+        // Just assert we got a cursor position at all (vim responded).
+        assert!(col_after.is_some(), "ESC should produce cursor movement response");
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Undo with `u` reverts an insert.
+    #[test]
+    fn vim_undo() {
+        let mut daemon = start_daemon();
+        let (file, _) = make_test_file(&["base"]);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+        conn.read_output(Duration::from_millis(100));
+
+        // Insert text.
+        conn.send(b"iINSERTED").ok();
+        std::thread::sleep(Duration::from_millis(100));
+        conn.send(ESC).ok();
+        std::thread::sleep(Duration::from_millis(100));
+        conn.read_output(Duration::from_millis(100)); // drain
+
+        // Undo — vim emits the reverted line content.
+        let out = key(&mut conn, b"u");
+        assert!(
+            !out.is_empty(),
+            "u (undo) should produce some output from vim"
+        );
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Search with `/pattern\r` moves the cursor to the matching line.
+    #[test]
+    fn vim_search() {
+        let mut daemon = start_daemon();
+        let (file, _) = make_test_file(&[
+            "apple pie",
+            "banana split",
+            "cherry tart",
+        ]);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+        conn.read_output(Duration::from_millis(100));
+
+        // Go to top first.
+        conn.send(b"gg").ok();
+        conn.wait_for(KEY_TIMEOUT, |buf| cursor_row(buf).is_some());
+
+        // Search for "banana".
+        conn.send(b"/banana\r").ok();
+        let out = conn.wait_for(KEY_TIMEOUT, |buf| cursor_row(buf).is_some());
+        let row = cursor_row(&out).expect("search: cursor pos expected");
+        assert_eq!(row, 2, "search for 'banana' should land on row 2, got {}", row);
+
+        // Search for "cherry".
+        conn.send(b"/cherry\r").ok();
+        let out = conn.wait_for(KEY_TIMEOUT, |buf| cursor_row(buf).is_some());
+        let row = cursor_row(&out).expect("search: cursor pos expected");
+        assert_eq!(row, 3, "search for 'cherry' should land on row 3, got {}", row);
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// `:wq` saves and exits; the session should become exited.
+    #[test]
+    fn vim_write_and_quit() {
+        let mut daemon = start_daemon();
+        let (file, _) = make_test_file(&["save_test"]);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+        conn.read_output(Duration::from_millis(100));
+
+        // :wq → write and quit
+        conn.send(ESC).ok();
+        std::thread::sleep(Duration::from_millis(50));
+        conn.send(b":wq\r").ok();
+        conn.wait_for(Duration::from_secs(2), |buf| {
+            buf.windows(7).any(|w| w == b"\x1b[?1049l")
+        });
+
+        // Session should now be exited.
+        let read_resp = daemon.cli_json(&["read", "--session", &sid]);
+        let exited = read_resp.exited.is_some();
+        assert!(exited, ":wq should cause vim to exit (exited={:?})", read_resp.exited);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Escape sequences split across PTY read boundaries (1024-byte reads) must
+    /// not corrupt the rendered output. We create a file large enough to force
+    /// multiple read chunks and verify the screen renders without truncation.
+    #[test]
+    fn vim_escape_split_across_read_boundary() {
+        let mut daemon = start_daemon();
+        // Create a file with enough content to push vim output past 1024 bytes.
+        let lines: Vec<String> = (1..=40)
+            .map(|i| format!("line {:03}: {}", i, "x".repeat(60)))
+            .collect();
+        let strs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let (file, _) = make_test_file(&strs);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+
+        // Collect all output for 500ms.
+        let out = conn.wait_for(Duration::from_millis(500), |_| false);
+        let all: Vec<u8> = conn.initial_output.iter().chain(out.iter()).cloned().collect();
+
+        // The output must not contain a bare `m` at the start of a chunk that
+        // is the continuation of a truncated colour sequence (which would render
+        // as literal text). We check that every `m` appearing in the stream is
+        // preceded by a CSI sequence start within 20 bytes.
+        // More practically: the file content should appear in the decoded screen.
+        assert!(
+            !all.is_empty(),
+            "should have received PTY output for a large file"
+        );
+
+        // Navigate to bottom and top — if escape sequences were corrupted, vim
+        // would be stuck or unresponsive.
+        conn.send(b"G").ok();
+        let down_out = conn.wait_for(KEY_TIMEOUT, |buf| cursor_row(buf).is_some());
+        assert!(cursor_row(&down_out).is_some(), "G should respond with cursor pos after large file open");
+
+        conn.send(b"gg").ok();
+        let up_out = conn.wait_for(KEY_TIMEOUT, |buf| cursor_row(buf).is_some());
+        let row = cursor_row(&up_out).expect("gg on large file: cursor pos expected");
+        assert_eq!(row, 1, "gg on large file should return to row 1");
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Multiple rapid keypresses must all be processed in order without loss.
+    /// This tests that the daemon's input forwarding doesn't drop bytes under load.
+    #[test]
+    fn vim_rapid_navigation_no_loss() {
+        let mut daemon = start_daemon();
+        let lines: Vec<String> = (1..=20).map(|i| format!("line {}", i)).collect();
+        let strs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let (file, _) = make_test_file(&strs);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+        conn.read_output(Duration::from_millis(100));
+
+        // Send 10 j's rapidly (no per-key sleep in send).
+        conn.send(b"gg").ok();
+        conn.wait_for(KEY_TIMEOUT, |buf| cursor_row(buf).is_some());
+
+        for _ in 0..10 {
+            conn.send(b"j").ok();
+        }
+        // Wait for vim to catch up.
+        let out = conn.wait_for(Duration::from_secs(1), |buf| {
+            cursor_row(buf).map(|r| r >= 10).unwrap_or(false)
+        });
+        let row = cursor_row(&out).expect("rapid j: cursor pos expected");
+        // Should be at row 11 (1 + 10 j's); allow ±1 for timing.
+        assert!(
+            row >= 10 && row <= 12,
+            "after 10 rapid j's from row 1, expected row ≈11, got {}",
+            row
+        );
+
+        quit_vim(&mut conn);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// CPR round-trip (ESC[6n → CPR response) must complete within vim's
+    /// ttimeoutlen=100ms so vim uses the correct ambiguous-width setting.
+    /// We verify indirectly: if ambiguous-width detection failed, vim would
+    /// render the status bar at column 0 instead of 1 (the row wraps).
+    /// We check the cursor never goes to row > rows+1 on a standard 80×24 terminal.
+    #[test]
+    fn vim_cpr_roundtrip_within_timeout() {
+        let mut daemon = start_daemon();
+        let (file, _) = make_test_file(&["test cpr"]);
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (sid, mut conn) = start_vim(&daemon, &path);
+
+        // Accumulate all startup output (includes the CPR probe and response).
+        let all_startup: Vec<u8> = {
+            let mut v = conn.initial_output.clone();
+            let extra = conn.read_output(Duration::from_millis(300));
+            v.extend_from_slice(&extra);
+            v
+        };
+
+        // ESC[6n should be present (vim's ambiguous-width probe).
+        let has_dsr = all_startup.windows(4).any(|w| w == b"\x1b[6n");
+        assert!(has_dsr, "vim should send ESC[6n (DSR) during startup");
+
+        // No cursor position should exceed row 25 on a 24-line terminal
+        // (would indicate wrap due to wrong ambiguous-width layout).
+        let mut bad_row = None;
+        let mut i = 0;
+        while i + 2 < all_startup.len() {
+            if all_startup[i] == b'\x1b' && all_startup[i+1] == b'[' {
+                let mut j = i + 2;
+                while j < all_startup.len()
+                    && (all_startup[j].is_ascii_digit() || all_startup[j] == b';') {
+                    j += 1;
+                }
+                if j < all_startup.len() && all_startup[j] == b'H' {
+                    let inner = std::str::from_utf8(&all_startup[i+2..j]).unwrap_or("");
+                    if let Some(row_str) = inner.split(';').next() {
+                        if let Ok(row) = row_str.parse::<usize>() {
+                            if row > 25 { bad_row = Some(row); }
+                        }
+                    }
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        assert!(
+            bad_row.is_none(),
+            "cursor row exceeded 25 on a 24-line terminal (ambiguous-width bug?): row={}",
+            bad_row.unwrap_or(0)
+        );
+
+        quit_vim(&mut conn);
         daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();
     }

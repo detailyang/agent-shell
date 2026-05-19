@@ -6,7 +6,7 @@ use nix::libc;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 /// Per-client read cursor state.
 #[derive(Debug)]
@@ -19,6 +19,10 @@ struct AppState {
     config: Config,
     sessions: HashMap<String, Session>,
     clients: HashMap<String, ClientState>,
+    /// Notified whenever any session's PTY produces new output.
+    /// attach loops await this instead of a fixed 50 ms poll so that
+    /// PTY→terminal latency is near-zero (important for ESC[6n CPR round-trips).
+    pty_output_notify: Arc<Notify>,
 }
 
 pub async fn run(
@@ -48,10 +52,12 @@ pub async fn run(
 
     eprintln!("agent-shell daemon listening on {:?}", socket_path);
 
+    let pty_notify = Arc::new(Notify::new());
     let state = Arc::new(Mutex::new(AppState {
         config,
         sessions: HashMap::new(),
         clients: HashMap::new(),
+        pty_output_notify: pty_notify,
     }));
 
     // Cleanup clients that have been inactive for > 10 minutes
@@ -66,21 +72,27 @@ pub async fn run(
         }
     });
 
-    // Background reaper: periodically check all sessions for exited children
-    // and reap zombies. This ensures idle sessions don't leave <defunct>
-    // processes when their child exits outside of a send/wait cycle.
+    // Background reaper: periodically drain all PTY masters and reap zombies.
+    // After each feed() round we notify waiting attach loops so they can
+    // forward new PTY output to clients without waiting for the 50 ms poll.
     let reaper_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
         loop {
             interval.tick().await;
-            let mut s = reaper_state.lock().await;
-            for session in s.sessions.values_mut() {
-                if session.exited.is_none() {
-                    session.feed();
-                    session.check_exited();
+            let notify = {
+                let mut s = reaper_state.lock().await;
+                let mut any_new = false;
+                for session in s.sessions.values_mut() {
+                    if session.exited.is_none() {
+                        let n = session.feed();
+                        if n > 0 { any_new = true; }
+                        session.check_exited();
+                    }
                 }
-            }
+                if any_new { Some(s.pty_output_notify.clone()) } else { None }
+            };
+            if let Some(n) = notify { n.notify_waiters(); }
         }
     });
 
@@ -175,7 +187,8 @@ async fn handle_request(req: Request, state: Arc<Mutex<AppState>>) -> Response {
     match req {
         Request::Create {
             name,
-            shell,
+            program,
+            args,
             cwd,
             env,
             prompt,
@@ -185,7 +198,7 @@ async fn handle_request(req: Request, state: Arc<Mutex<AppState>>) -> Response {
             record,
         } => {
             let cwd = cwd.map(std::path::PathBuf::from);
-            handle_create(state, name, shell, cwd, env, prompt, rows, cols, buffer_size, record).await
+            handle_create(state, name, program, args, cwd, env, prompt, rows, cols, buffer_size, record).await
         }
 
         Request::Destroy { session_id } => handle_destroy(state, session_id).await,
@@ -248,7 +261,8 @@ async fn handle_request(req: Request, state: Arc<Mutex<AppState>>) -> Response {
 async fn handle_create(
     state: Arc<Mutex<AppState>>,
     name: Option<String>,
-    shell: Option<String>,
+    program: Option<String>,
+    args: Option<Vec<String>>,
     cwd: Option<std::path::PathBuf>,
     env: Option<HashMap<String, String>>,
     prompt: Option<String>,
@@ -263,7 +277,7 @@ async fn handle_create(
         config = s.config.clone();
     }
 
-    match Session::new(&config, name, shell, cwd, env, prompt, rows, cols, buffer_size, record) {
+    match Session::new(&config, name, program, args, cwd, env, prompt, rows, cols, buffer_size, record) {
         Ok(session) => {
             let id = session.id.clone();
             let recording_path = session.recording.as_ref().map(|_| {
@@ -1091,11 +1105,16 @@ async fn handle_attach(
     session_id: String,
     readonly: bool,
 ) {
+    // Grab the shared PTY-output notifier before entering the loop.
+    let pty_notify: Arc<Notify> = {
+        let s = state.lock().await;
+        s.pty_output_notify.clone()
+    };
     // ── Phase 1: validate & send initial JSON handshake ──────────────────
     // Instead of using VteGrid full_redraw (which strips colors/attributes),
     // we transmit the raw PTY output bytes from the ring buffer.
     // The client's real terminal will interpret the escape sequences correctly.
-    let (raw_output, start_cursor) = {
+    let (raw_output, start_cursor, already_exited) = {
         let mut s = state.lock().await;
         let session = match s.sessions.get_mut(&session_id) {
             Some(s) => s,
@@ -1104,18 +1123,18 @@ async fn handle_attach(
                 return;
             }
         };
-        if session.exited.is_some() {
-            send_response(&mut stream, &Response::err("session exited")).await;
-            return;
-        }
         if session.destroying {
             send_response(&mut stream, &Response::err("session is being destroyed")).await;
             return;
         }
+        // Allow attaching to exited sessions: drain whatever is in the ringbuf
+        // and immediately close. This handles short-lived programs (ls, echo, etc.)
+        // that finish before the attach handshake arrives.
+        let already_exited = session.exited.is_some();
         session.feed();
         let wc = session.ringbuf.write_cursor();
         let (raw_bytes, _gap, _lost) = session.ringbuf.read(0);
-        (raw_bytes, wc)
+        (raw_bytes, wc, already_exited)
     };
 
     // JSON response carries the raw PTY output.
@@ -1130,6 +1149,13 @@ async fn handle_attach(
         ..Response::ok()
     };
     send_response(&mut stream, &init_resp).await;
+
+    // Short-lived programs (ls, echo, etc.) may have already exited by the time
+    // we reach here. The ringbuf data was sent in the handshake above; nothing
+    // more to stream.
+    if already_exited {
+        return;
+    }
 
     // ── Phase 2: raw binary bidirectional streaming ─────────────────────
     // We do NOT use AsyncFd on the PTY master fd. The PTY fd lifetime is
@@ -1147,26 +1173,32 @@ async fn handle_attach(
         let mut stdin_buf = [0u8; 4096];
 
         if readonly {
-            // ── readonly: wait for ringbuf data or stdin exit key ──
+            // ── readonly: wake on PTY output or stdin exit key ──
+            // Use pty_notify so new PTY output is forwarded immediately instead
+            // of waiting up to 50 ms for a timer tick.
             tokio::select! {
-                // stdin → check for exit keys only
-                result = stdin_read_with_timeout(&mut stream_rx, &mut stdin_buf, std::time::Duration::from_millis(50)) => {
+                // PTY has new output → fall through to ringbuf drain below
+                _ = pty_notify.notified() => {}
+                // stdin → check for exit keys only (50 ms timeout as safety net)
+                result = stdin_read_with_timeout(&mut stream_rx, &mut stdin_buf,
+                                                 std::time::Duration::from_millis(50)) => {
                     match result {
                         StreamEvent::Data(data) => {
-                            // Ctrl-C or Ctrl-D exits readonly attach
                             if data.contains(&0x03) || data.contains(&0x04) {
                                 running = false;
                             }
                         }
                         StreamEvent::Eof => running = false,
-                        StreamEvent::Timeout => {
-                            // Periodic ringbuf drain — send/reaper already feed() into ringbuf
-                        }
+                        StreamEvent::Timeout => {}
                     }
                 }
             }
         } else {
-            // ── rw: select between client-stdin and ringbuf-poll ──
+            // ── rw: wake on client keystroke OR PTY output ──
+            // The third select! arm (pty_notify) ensures PTY→client latency is
+            // not bounded by the 50 ms poll interval. This is critical for
+            // round-trip sequences like ESC[6n → CPR that vim uses to detect
+            // terminal capabilities during startup (ttimeoutlen = 100 ms).
             tokio::select! {
                 // client keystroke → PTY
                 result = stream_rx.read(&mut stdin_buf) => {
@@ -1205,7 +1237,9 @@ async fn handle_attach(
                         Err(_) => { running = false; continue; }
                     }
                 }
-                // Periodic ringbuf check
+                // PTY has new output → fall through to ringbuf drain below
+                _ = pty_notify.notified() => {}
+                // Safety-net fallback: drain even without a notification
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
             }
         }
@@ -1213,10 +1247,11 @@ async fn handle_attach(
         // ── drain ringbuf output → client ──
         let (data, exited, gone) = {
             let mut s = state.lock().await;
+            let notify = s.pty_output_notify.clone();
             match s.sessions.get_mut(&session_id) {
                 Some(session) => {
-                    // Feed PTY→ringbuf ourselves in case no one else did
-                    session.feed();
+                    // Feed PTY→ringbuf; if new bytes arrived, wake other attach loops.
+                    let n = session.feed();
                     let exited = session.exited.is_some();
                     let wc = session.ringbuf.write_cursor();
                     let data = if wc > pty_cursor {
@@ -1226,6 +1261,7 @@ async fn handle_attach(
                     } else {
                         Vec::new()
                     };
+                    if n > 0 { notify.notify_waiters(); }
                     (data, exited, false)
                 }
                 None => (Vec::new(), false, true),

@@ -14,11 +14,24 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Commands {
-    /// Create a new PTY session
+    /// Create a new PTY session.
+    ///
+    /// Examples:
+    ///   agent-shell create                      # start default shell
+    ///   agent-shell create -c "vim Cargo.toml"  # start vim directly
+    ///   agent-shell create -c "echo hello"      # run echo (exits immediately)
     Create {
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
+        /// Command to run, parsed with POSIX word-splitting and exec'd directly.
+        /// e.g.  -c "vim Cargo.toml"  ->  exec vim Cargo.toml
+        ///       -c "echo hello"      ->  exec echo hello
+        /// No shell wrapper — the first word is the executable.
+        #[arg(short = 'c')]
+        cmd: Option<String>,
+        /// Executable to launch directly (hidden; use -c for commands).
+        /// Kept for backwards-compatibility with scripts that used --shell.
+        #[arg(long = "shell", hide = true)]
         shell: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
@@ -244,7 +257,7 @@ async fn main() {
 
 fn command_to_request(cmd: Commands) -> Request {
     match cmd {
-        Commands::Create { name, shell, cwd, envs, prompt, rows, cols, buffer_size, record } => {
+        Commands::Create { name, cmd, shell, cwd, envs, prompt, rows, cols, buffer_size, record } => {
             let env = envs.map(|pairs| {
                 let mut map = std::collections::HashMap::new();
                 for pair in pairs {
@@ -254,7 +267,36 @@ fn command_to_request(cmd: Commands) -> Request {
                 }
                 map
             });
-            Request::Create { name, shell, cwd, env, prompt, rows, cols, buffer_size, record: if record { Some(true) } else { None } }
+
+            // Priority: -c > --shell (compat) > None
+            //   -c "vim Cargo.toml"  -> shell_words::split -> ["vim", "Cargo.toml"]  (direct exec)
+            //   --shell /bin/zsh     -> ["/bin/zsh"]  (compat, hidden)
+            //   (neither)            -> None  (daemon uses default_program, i.e. bash)
+            let args: Option<Vec<String>> = if let Some(c) = cmd {
+                match shell_words::split(&c) {
+                    Ok(words) if !words.is_empty() => Some(words),
+                    Ok(_) => None,
+                    Err(e) => {
+                        eprintln!("Error: -c parse failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                shell.map(|s| vec![s])
+            };
+
+            Request::Create {
+                name,
+                program: None,
+                args,
+                cwd,
+                env,
+                prompt,
+                rows,
+                cols,
+                buffer_size,
+                record: if record { Some(true) } else { None },
+            }
         }
         Commands::Destroy { session } => Request::Destroy { session_id: session },
         Commands::Send { session, text, ctrl, nowait, timeout, client_id } => Request::Send {
@@ -444,6 +486,7 @@ fn enter_raw_mode() -> Option<RawModeGuard> {
     Some(RawModeGuard { original })
 }
 
+
 async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
     let readonly = !matches!(&req, Request::Attach { writable: Some(true), .. });
 
@@ -485,8 +528,10 @@ async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
         return Err(resp.error.unwrap_or_else(|| "attach failed".into()));
     }
 
-    // Decode the base64-encoded raw PTY output and write to terminal.
-    // This preserves all escape sequences (colors, cursor movement, etc.).
+    // Phase 2: raw binary bidirectional streaming.
+    // Enter raw mode BEFORE writing the initial snapshot.
+    let _raw_guard = enter_raw_mode();
+
     if let Some(output) = &resp.output {
         match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, output) {
             Ok(bytes) => {
@@ -494,15 +539,11 @@ async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
                 let _ = std::io::stdout().flush();
             }
             Err(_) => {
-                // Fallback: treat as plain text (for backwards compat)
                 let _ = std::io::stdout().write_all(output.as_bytes());
                 let _ = std::io::stdout().flush();
             }
         }
     }
-
-    // ── Phase 2: raw binary bidirectional streaming ────────────────
-    let _raw_guard = enter_raw_mode();
 
     let (mut stream_rx, mut stream_tx) = stream.into_split();
     let mut stdin_handle = tokio::io::stdin();
@@ -697,4 +738,58 @@ fn kill_daemon(config: &Config) -> Result<bool, String> {
     let _ = std::fs::remove_file(&pid_path);
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_create(cmd: Option<&str>) -> Request {
+        command_to_request(Commands::Create {
+            name: None,
+            cmd: cmd.map(|s| s.to_string()),
+            shell: None,
+            cwd: None,
+            envs: None,
+            prompt: None,
+            rows: None,
+            cols: None,
+            buffer_size: None,
+            record: false,
+        })
+    }
+
+    #[test]
+    fn no_cmd_passes_none_args() {
+        // agent-shell create  ->  daemon uses default_program
+        match make_create(None) {
+            Request::Create { args, program, .. } => {
+                assert_eq!(args, None);
+                assert_eq!(program, None);
+            }
+            _ => panic!("expected Create"),
+        }
+    }
+
+    #[test]
+    fn cmd_word_splits_into_argv() {
+        // agent-shell create -c "vim Cargo.toml"  ->  ["vim", "Cargo.toml"]
+        match make_create(Some("vim Cargo.toml")) {
+            Request::Create { args, .. } => {
+                assert_eq!(args, Some(vec!["vim".to_string(), "Cargo.toml".to_string()]));
+            }
+            _ => panic!("expected Create"),
+        }
+    }
+
+    #[test]
+    fn cmd_single_word_is_single_argv() {
+        // agent-shell create -c "bash"  ->  ["bash"]
+        match make_create(Some("bash")) {
+            Request::Create { args, .. } => {
+                assert_eq!(args, Some(vec!["bash".to_string()]));
+            }
+            _ => panic!("expected Create"),
+        }
+    }
 }

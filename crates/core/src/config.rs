@@ -31,8 +31,11 @@ impl DaemonConfig {
 pub struct SessionConfig {
     #[serde(default = "SessionConfig::default_buffer_size")]
     pub default_buffer_size: usize,
-    #[serde(default = "SessionConfig::default_shell")]
-    pub default_shell: String,
+    /// Default program to launch when `create` is called without an explicit
+    /// program / argv. Typically a shell such as `/bin/bash` or `/bin/zsh`,
+    /// but can be any executable (e.g. `/usr/bin/python3`, `vim`, …).
+    #[serde(default = "SessionConfig::default_program", alias = "default_shell")]
+    pub default_program: String,
     #[serde(default = "SessionConfig::default_rows")]
     pub default_rows: u16,
     #[serde(default = "SessionConfig::default_cols")]
@@ -47,7 +50,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         SessionConfig {
             default_buffer_size: Self::default_buffer_size(),
-            default_shell: Self::default_shell(),
+            default_program: Self::default_program(),
             default_rows: Self::default_rows(),
             default_cols: Self::default_cols(),
             default_prompt: String::new(),
@@ -60,7 +63,7 @@ impl SessionConfig {
     fn default_buffer_size() -> usize {
         524288
     }
-    fn default_shell() -> String {
+    fn default_program() -> String {
         "/bin/bash".to_string()
     }
     fn default_rows() -> u16 {
@@ -161,7 +164,7 @@ mod tests {
     fn default_config() {
         let config = Config::default();
         assert_eq!(config.session.default_buffer_size, 524288);
-        assert_eq!(config.session.default_shell, "/bin/bash");
+        assert_eq!(config.session.default_program, "/bin/bash");
         assert_eq!(config.session.default_rows, 24);
         assert_eq!(config.session.default_cols, 80);
         assert!(!config.session.record_by_default);
@@ -187,7 +190,7 @@ default_shell = "/bin/zsh"
         let config = Config::load_from(path);
         assert_eq!(config.daemon.socket_path, "/tmp/test.sock");
         assert_eq!(config.session.default_buffer_size, 1048576);
-        assert_eq!(config.session.default_shell, "/bin/zsh");
+        assert_eq!(config.session.default_program, "/bin/zsh");
     }
 
     #[test]

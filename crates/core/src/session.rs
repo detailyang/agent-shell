@@ -39,7 +39,8 @@ pub struct Session {
     pub rows: u16,
     pub cols: u16,
     pub buffer_size: usize,
-    pub shell: String,
+    /// argv[0] of the launched process (for display purposes).
+    pub program: String,
     pub send_seq: u64,
     pub recording: Option<Recording>,
     pub prev_fg_pgid: i32,
@@ -55,7 +56,8 @@ impl Session {
     pub fn new(
         config: &Config,
         name: Option<String>,
-        shell: Option<String>,
+        program: Option<String>,
+        args: Option<Vec<String>>,
         cwd: Option<PathBuf>,
         env: Option<HashMap<String, String>>,
         prompt: Option<String>,
@@ -64,7 +66,17 @@ impl Session {
         buffer_size: Option<usize>,
         record: Option<bool>,
     ) -> Result<Self, String> {
-        let shell = shell.unwrap_or_else(|| config.session.default_shell.clone());
+        // Resolve the argv to spawn.
+        // Priority: args > program > config default_program.
+        let argv: Vec<String> = if let Some(a) = args.filter(|v| !v.is_empty()) {
+            a
+        } else {
+            let exe = program.unwrap_or_else(|| config.session.default_program.clone());
+            vec![exe]
+        };
+        // argv[0] stored for display / bookkeeping.
+        let program_display = argv[0].clone();
+
         let rows = rows.unwrap_or(config.session.default_rows);
         let cols = cols.unwrap_or(config.session.default_cols);
         let buffer_size = buffer_size
@@ -91,7 +103,10 @@ impl Session {
             })
             .map_err(|e| format!("failed to open pty: {}", e))?;
 
-        let mut cmd = CommandBuilder::new(&shell);
+        let mut cmd = CommandBuilder::new(&argv[0]);
+        if argv.len() > 1 {
+            cmd.args(&argv[1..]);
+        }
         cmd.cwd(cwd.clone().unwrap_or_else(|| PathBuf::from(".")));
 
         if let Some(env) = env {
@@ -181,7 +196,7 @@ impl Session {
             rows,
             cols,
             buffer_size,
-            shell,
+            program: program_display,
             send_seq: 0,
             recording,
             child,

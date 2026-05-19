@@ -7,7 +7,14 @@ pub enum Request {
     #[serde(rename = "create")]
     Create {
         name: Option<String>,
-        shell: Option<String>,
+        /// argv[0]: the executable to launch. Falls back to `default_program`
+        /// in config when absent. Ignored when `args` is present.
+        #[serde(alias = "shell")]
+        program: Option<String>,
+        /// Full argument vector. argv[0] is the executable, the rest are its
+        /// arguments. When present, takes priority over `program`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Vec<String>>,
         cwd: Option<String>,
         env: Option<std::collections::HashMap<String, String>>,
         prompt: Option<String>,
@@ -15,6 +22,7 @@ pub enum Request {
         cols: Option<u16>,
         buffer_size: Option<usize>,
         record: Option<bool>,
+
     },
 
     #[serde(rename = "destroy")]
@@ -184,7 +192,8 @@ mod tests {
     fn roundtrip_create() {
         let req = Request::Create {
             name: Some("test".into()),
-            shell: None,
+            program: None,
+            args: None,
             cwd: Some("/tmp".into()),
             env: None,
             prompt: Some("^\\$ $".into()),
