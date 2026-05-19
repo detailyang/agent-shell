@@ -129,9 +129,16 @@ impl Config {
     }
 
     /// Return the recording directory path.
+    /// Respects AGENT_SHELL_HOME for test isolation. If the user has explicitly
+    /// configured `recording.dir` in config.toml (non-default), that takes priority.
     pub fn recording_dir(&self) -> PathBuf {
-        let p = shellexpand::tilde(&self.recording.dir).to_string();
-        PathBuf::from(p)
+        // If user explicitly set a custom recording dir, respect it.
+        if self.recording.dir != RecordingConfig::default_dir() {
+            let p = shellexpand::tilde(&self.recording.dir).to_string();
+            return PathBuf::from(p);
+        }
+        // Otherwise, derive from base_dir (which respects AGENT_SHELL_HOME)
+        Self::base_dir().join("recordings")
     }
 
     /// Return the base directory.
@@ -187,5 +194,37 @@ default_shell = "/bin/zsh"
     fn load_missing_file() {
         let config = Config::load_from(PathBuf::from("/nonexistent/config.toml"));
         assert_eq!(config.session.default_buffer_size, 524288);
+    }
+
+    /// Test recording_dir behavior with AGENT_SHELL_HOME.
+    /// Combined into one test to avoid env var races in parallel execution.
+    #[test]
+    fn recording_dir_env_behavior() {
+        let prev = std::env::var("AGENT_SHELL_HOME").ok();
+
+        // Part 1: AGENT_SHELL_HOME set → recording_dir uses it
+        std::env::set_var("AGENT_SHELL_HOME", "/tmp/test_home_rec");
+        let config = Config::default();
+        let dir = config.recording_dir();
+        assert_eq!(dir, PathBuf::from("/tmp/test_home_rec/recordings"));
+
+        // Part 2: explicit recording.dir overrides AGENT_SHELL_HOME
+        let mut config2 = Config::default();
+        config2.recording.dir = "/custom/recordings".to_string();
+        let dir2 = config2.recording_dir();
+        assert_eq!(dir2, PathBuf::from("/custom/recordings"));
+
+        // Part 3: no AGENT_SHELL_HOME → falls back to ~/.agent-shell/recordings
+        std::env::remove_var("AGENT_SHELL_HOME");
+        let config3 = Config::default();
+        let dir3 = config3.recording_dir();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        assert_eq!(dir3, PathBuf::from(home).join(".agent-shell/recordings"));
+
+        // Restore
+        match prev {
+            Some(v) => std::env::set_var("AGENT_SHELL_HOME", v),
+            None => {} // already removed above
+        }
     }
 }

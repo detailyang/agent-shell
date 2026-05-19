@@ -1781,6 +1781,109 @@ mod recording_verify {
         daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();
     }
+
+    /// Verify recording path is under AGENT_SHELL_HOME (test isolation)
+    #[test]
+    fn recording_path_under_agent_shell_home() {
+        let mut daemon = start_daemon();
+        let home = daemon.temp_dir_path();
+        let resp = daemon.cli_json(&["create", "--name", "rec_isolated", "--record"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let recording_path = resp.recording.clone().expect("should have recording path");
+        assert!(
+            recording_path.starts_with(home.to_str().unwrap()),
+            "recording path '{}' should be under AGENT_SHELL_HOME '{}'",
+            recording_path,
+            home.display()
+        );
+        assert!(
+            recording_path.contains("recordings"),
+            "recording path should contain 'recordings' subdir"
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Verify recording content: correct in/out events with decodable data
+    #[test]
+    fn recording_content_correct() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "rec_content", "--record"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+        let recording_path = resp.recording.clone().expect("should have recording path");
+
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "echo rec_marker_xyz"]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+
+        // Parse recording file
+        let content = std::fs::read_to_string(&recording_path)
+            .expect("read recording file");
+        let events: Vec<serde_json::Value> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        assert!(events.len() >= 2, "should have at least 2 events, got {}", events.len());
+
+        // Check we have both in and out events
+        let has_in = events.iter().any(|e| e["dir"] == "in");
+        let has_out = events.iter().any(|e| e["dir"] == "out");
+        assert!(has_in, "should have 'in' events");
+        assert!(has_out, "should have 'out' events");
+
+        // Verify an 'in' event contains our command
+        let in_events: Vec<&serde_json::Value> = events.iter()
+            .filter(|e| e["dir"] == "in")
+            .collect();
+        let mut found_command = false;
+        for ev in &in_events {
+            let data_b64 = ev["data"].as_str().unwrap_or("");
+            if let Ok(bytes) = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD, data_b64
+            ) {
+                let text = String::from_utf8_lossy(&bytes);
+                if text.contains("echo rec_marker_xyz") {
+                    found_command = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_command, "should find 'echo rec_marker_xyz' in input events");
+
+        // Verify an 'out' event contains the command output
+        let out_events: Vec<&serde_json::Value> = events.iter()
+            .filter(|e| e["dir"] == "out")
+            .collect();
+        let mut found_output = false;
+        for ev in &out_events {
+            let data_b64 = ev["data"].as_str().unwrap_or("");
+            if let Ok(bytes) = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD, data_b64
+            ) {
+                let text = String::from_utf8_lossy(&bytes);
+                if text.contains("rec_marker_xyz") {
+                    found_output = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_output, "should find 'rec_marker_xyz' in output events");
+
+        // Verify timestamps are monotonically non-decreasing
+        let timestamps: Vec<u64> = events.iter()
+            .filter_map(|e| e["ts"].as_u64())
+            .collect();
+        for w in timestamps.windows(2) {
+            assert!(w[1] >= w[0], "timestamps should be non-decreasing: {} < {}", w[0], w[1]);
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2298,35 +2401,117 @@ mod set_prompt_edge {
 mod replay {
     use super::*;
 
-    /// Create session with --record, produce output, replay should succeed
+    /// Create session with --record, produce output, replay --dump should contain expected text
     #[test]
-    fn replay_recording() {
+    fn replay_dump_output_correct() {
         let mut daemon = start_daemon();
-        let resp = daemon.cli_json(&["create", "--name", "replay_test", "--record"]);
+        let resp = daemon.cli_json(&["create", "--name", "replay_dump", "--record"]);
         assert_ok(&resp);
         let sid = session_id(&resp);
-        let recording_path = resp.recording.clone();
+        let recording_path = resp.recording.clone().expect("should have recording path");
 
-        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "echo replay_output"]);
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "echo replay_marker_abc"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let _ = daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();
 
-        // Now try to replay
-        if let Some(path) = &recording_path {
-            if std::path::Path::new(path).exists() {
-                let cli_bin = agent_shell_e2e::find_bin("agent-shell");
-                let output = std::process::Command::new(&cli_bin)
-                    .args(&["replay", path])
-                    .output()
-                    .expect("replay command should work");
-                // Replay should exit successfully (or at least not crash)
-                // We don't validate the exact output format, just that it runs
-                assert!(output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty(),
-                    "replay should produce some output");
-            }
-        }
+        // Replay with --dump --force
+        let cli_bin = agent_shell_e2e::find_bin("agent-shell");
+        let output = std::process::Command::new(&cli_bin)
+            .args(&["replay", &recording_path, "--dump", "--force"])
+            .output()
+            .expect("replay command should work");
+
+        assert!(output.status.success(), "replay --dump should exit successfully");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("replay_marker_abc"),
+            "replay --dump should contain command output. Got: {:?}",
+            &stdout[..stdout.len().min(500)]
+        );
+    }
+
+    /// Replay timed mode should also succeed and contain output
+    #[test]
+    fn replay_timed_output() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "replay_timed", "--record"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+        let recording_path = resp.recording.clone().expect("should have recording path");
+
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "echo timed_marker_def"]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+
+        // Replay timed at 1000x speed
+        let cli_bin = agent_shell_e2e::find_bin("agent-shell");
+        let output = std::process::Command::new(&cli_bin)
+            .args(&["replay", &recording_path, "--speed", "1000"])
+            .output()
+            .expect("replay timed should work");
+
+        assert!(output.status.success(), "replay timed should exit successfully");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("timed_marker_def"),
+            "replay timed should contain raw output (not escaped). Got: {:?}",
+            &stdout[..stdout.len().min(500)]
+        );
+        // Verify it does NOT contain [INPUT] annotations (old behavior removed)
+        assert!(
+            !stdout.contains("[INPUT]"),
+            "replay timed should not contain [INPUT] annotations"
+        );
+    }
+
+    /// Replay an empty recording file should succeed without crash
+    #[test]
+    fn replay_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_file = dir.path().join("empty.jsonl");
+        std::fs::write(&empty_file, "").unwrap();
+
+        let cli_bin = agent_shell_e2e::find_bin("agent-shell");
+        let output = std::process::Command::new(&cli_bin)
+            .args(&["replay", empty_file.to_str().unwrap(), "--dump", "--force"])
+            .output()
+            .expect("replay should handle empty file");
+
+        assert!(output.status.success(), "replay of empty file should succeed");
+        assert!(output.stdout.is_empty(), "replay of empty file should produce no stdout");
+    }
+
+    /// Replay a file with corrupted lines should skip bad lines and not crash
+    #[test]
+    fn replay_corrupted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_file = dir.path().join("bad.jsonl");
+
+        // Mix valid and invalid lines
+        let valid_event = serde_json::json!({
+            "ts": 1000,
+            "dir": "out",
+            "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"hello")
+        });
+        let content = format!(
+            "not json at all\n{}\n{{broken json\n",
+            serde_json::to_string(&valid_event).unwrap()
+        );
+        std::fs::write(&bad_file, content).unwrap();
+
+        let cli_bin = agent_shell_e2e::find_bin("agent-shell");
+        let output = std::process::Command::new(&cli_bin)
+            .args(&["replay", bad_file.to_str().unwrap(), "--dump", "--force"])
+            .output()
+            .expect("replay should handle corrupted file");
+
+        assert!(output.status.success(), "replay of corrupted file should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("hello"), "should still output valid events");
     }
 }
 
@@ -4234,6 +4419,80 @@ mod mouse {
             "mouse", "--session", &sid, "release", "--x", "10", "--y", "10",
         ]);
         assert_ok(&resp);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_scroll_missing_direction() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_nodir"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "scroll", "--x", "10", "--y", "5",
+        ]);
+        assert_error(&resp, "direction");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_drag_missing_to() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_noto"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Missing --to-x and --to-y
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "drag", "--x", "1", "--y", "1",
+        ]);
+        assert_error(&resp, "drag requires");
+
+        // Has --to-x but missing --to-y
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "drag",
+            "--x", "1", "--y", "1", "--to-x", "10",
+        ]);
+        assert_error(&resp, "drag requires");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_drag_steps_limit() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_steps"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "drag",
+            "--x", "1", "--y", "1", "--to-x", "20", "--to-y", "10",
+            "--steps", "101",
+        ]);
+        assert_error(&resp, "steps");
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_unknown_action() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_unk"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "hover", "--x", "10", "--y", "5",
+        ]);
+        assert_error(&resp, "unknown mouse action");
 
         daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();

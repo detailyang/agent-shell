@@ -152,5 +152,5 @@ agent-shell create --name ci --env NODE_ENV=test --cwd /proj | jq -r .session_id
 - **Ring buffer is 512 KB.** Old data overwritten when full. Lagging `--client-id` gets `gap:true,lost_bytes:N`.
 - **`mouse` is fire-and-forget.** If the PTY program hasn't enabled mouse mode, sequences are silently ignored.
 - **Mouse coordinates are 1-based** and validated against session cols/rows. Out-of-bounds → error.
-- **Mouse `--count` max is 100.** Prevents accidental flooding.
+- **Mouse `--count` max is 100, `--steps` max is 100.** Prevents accidental flooding.
 - **`AGENT_SHELL_HOME`** overrides base directory (for testing).

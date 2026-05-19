@@ -993,6 +993,9 @@ async fn handle_mouse(
                 None => return Response::err("drag requires --to-y"),
             };
             let steps = steps.unwrap_or(5);
+            if steps > 100 {
+                return Response::err("steps must be <= 100");
+            }
             mouse::encode_drag(btn, x, y, tx, ty, steps)
         }
         other => return Response::err(format!("unknown mouse action: '{}'", other)),

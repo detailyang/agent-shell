@@ -135,36 +135,19 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
             }
             last_ts = Some(event.ts);
 
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(&event.data)
-                .unwrap_or_default();
-
+            // Only replay output events (raw bytes preserve VT100 sequences)
             if event.dir == "out" {
-                let escaped = escape_for_terminal(&bytes);
-                out.write_all(escaped.as_bytes())?;
-            } else {
-                let escaped = escape_for_terminal(&bytes);
-                write!(out, "\r\n[INPUT] {}\r\n", escaped)?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&event.data)
+                    .unwrap_or_default();
+                out.write_all(&bytes)?;
+                out.flush()?;
             }
+            // Input events are silently skipped
         }
     }
     out.flush()?;
     Ok(())
-}
-
-fn escape_for_terminal(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len());
-    for &b in bytes {
-        match b {
-            0x0a => s.push('\n'),
-            0x0d => s.push('\r'),
-            0x20..=0x7e => s.push(b as char),
-            _ => {
-                s.push_str(&format!("\\x{:02x}", b));
-            }
-        }
-    }
-    s
 }
 
 #[cfg(test)]
