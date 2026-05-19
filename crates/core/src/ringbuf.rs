@@ -224,4 +224,68 @@ mod tests {
         let (data, _, _) = rb.read(5);
         assert!(data.is_empty());
     }
+
+    /// Incremental reads from an advancing cursor should only return new data,
+    /// not re-read previously seen bytes — validates the prompt-check cursor
+    /// optimisation pattern used in handle_send.
+    #[test]
+    fn incremental_cursor_reads_only_new_data() {
+        let mut rb = RingBuffer::new(4096);
+        rb.write(b"first");
+        let cursor_after_first = rb.write_cursor(); // 5
+        rb.write(b"second");
+        let cursor_after_second = rb.write_cursor(); // 11
+
+        // Read only from 'second' onwards
+        let (data, gap, _) = rb.read(cursor_after_first);
+        assert_eq!(data, b"second");
+        assert!(!gap);
+
+        // Nothing new beyond cursor_after_second
+        let (data, _, _) = rb.read(cursor_after_second);
+        assert!(data.is_empty());
+    }
+
+    /// After a fast-path fill followed by a slow-path write, the ring buffer
+    /// must report the correct bytes via read().
+    /// We use MIN_BUFFER_SIZE as the capacity because new() clamps to that minimum.
+    #[test]
+    fn fast_path_then_slow_path() {
+        let cap = MIN_BUFFER_SIZE; // 4096
+        let mut rb = RingBuffer::new(cap);
+
+        // Fast path: exactly fill the buffer
+        let fill = vec![b'a'; cap];
+        rb.write(&fill);
+        assert_eq!(rb.write_cursor(), cap as u64);
+
+        // Slow path: write 4 more bytes — should overwrite the oldest 4
+        rb.write(b"IJKL");
+        assert_eq!(rb.write_cursor(), (cap + 4) as u64);
+
+        // Reading from cursor 0 must show a gap of 4 bytes
+        let (data, gap, lost) = rb.read(0);
+        assert!(gap, "expected gap after overflow");
+        assert_eq!(lost, 4, "expected 4 lost bytes");
+        assert_eq!(data.len(), cap, "should get capacity bytes back");
+        // Last 4 bytes of the result must be 'IJKL'
+        assert_eq!(&data[cap - 4..], b"IJKL");
+    }
+
+    /// write() with a chunk larger than capacity must keep only the last
+    /// `capacity` bytes, and read() from cursor 0 must show a gap.
+    #[test]
+    fn write_larger_than_capacity() {
+        let cap = MIN_BUFFER_SIZE; // 4096
+        let mut rb = RingBuffer::new(cap);
+        // Write 2x capacity; the first `cap` bytes should be lost.
+        let data: Vec<u8> = (0..cap * 2).map(|i| (i % 256) as u8).collect();
+        rb.write(&data);
+        let (out, gap, lost) = rb.read(0);
+        assert!(gap, "expected gap");
+        assert_eq!(lost, cap as u64, "expected cap bytes lost");
+        assert_eq!(out.len(), cap, "should get cap bytes back");
+        // Should contain the last `cap` bytes of the input
+        assert_eq!(out, &data[cap..]);
+    }
 }

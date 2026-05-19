@@ -55,6 +55,8 @@ impl Recording {
 
         if let Ok(line) = serde_json::to_string(&event) {
             let _ = writeln!(self.file, "{}", line);
+            // Flush after every event so a crash doesn't lose recent data.
+            let _ = self.file.flush();
         }
     }
 

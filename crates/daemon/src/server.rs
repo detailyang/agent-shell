@@ -276,21 +276,24 @@ async fn handle_create(
                 // Non-fatal: feed() will still work, just may block briefly
             }
 
-            // Insert session into map first so daemon shutdown can find it.
-            // Then wait briefly for shell to start.
-            let mut s = state.lock().await;
-            s.sessions.insert(id.clone(), session);
+            // Insert session into map first so the reaper / shutdown tasks
+            // can see it immediately.
+            {
+                let mut s = state.lock().await;
+                s.sessions.insert(id.clone(), session);
+            } // lock released before sleep
 
-            // Wait for shell to initialize while holding the lock.
-            // This is safe because the lock is only held briefly and
-            // other handlers will wait. It ensures the session is
-            // visible to shutdown/reaper during this window.
+            // Wait briefly for the shell to initialise WITHOUT holding the
+            // mutex so that concurrent requests are not blocked.
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-            // Now feed and check pgid
-            if let Some(session) = s.sessions.get_mut(&id) {
-                session.feed();
-                session.check_fg_pgid();
+            // Re-acquire the lock just for the post-init feed / pgid check.
+            {
+                let mut s = state.lock().await;
+                if let Some(session) = s.sessions.get_mut(&id) {
+                    session.feed();
+                    session.check_fg_pgid();
+                }
             }
 
             Response {
@@ -517,7 +520,11 @@ async fn handle_send(
 
             let exit_code = session.check_exited();
 
-            // Check prompt regex match in new output
+            // Check prompt regex match in all output since this send started.
+            // We read from write_cursor_before (not prompt_check_cursor) to
+            // ensure prompts that arrive split across multiple PTY reads are
+            // still matched correctly. The allocation is bounded by buffer size
+            // and only occurs when a prompt regex is configured.
             let prompt_matched = if let Some(ref regex) = session.prompt_regex {
                 if wc > write_cursor_before {
                     let (new_data, _, _) = session.ringbuf.read(write_cursor_before);
@@ -669,6 +676,10 @@ async fn handle_read(
         None => return Response::err("session not found"),
     };
 
+    // Drain PTY in both paths (running and exited) to ensure the
+    // ring buffer reflects all available output before we read it.
+    session.feed();
+
     if let Some(exit_code) = session.exited {
         let (output, gap, lost_bytes) = read_from_cursor(&mut s, &session_id, &client_id);
         let mut resp = Response {
@@ -684,8 +695,6 @@ async fn handle_read(
         }
         return resp;
     }
-
-    session.feed();
     let (output, gap, lost_bytes) = read_from_cursor(&mut s, &session_id, &client_id);
 
     let mut resp = Response {
@@ -1176,9 +1185,15 @@ async fn handle_attach(
                                     running = false;
                                     continue;
                                 }
-                                if let Some(ref mut writer) = session.pty_writer.lock().ok() {
-                                    let _ = writer.write_all(data);
-                                    let _ = writer.flush();
+                                match session.pty_writer.lock() {
+                                    Ok(ref mut writer) => {
+                                        let _ = writer.write_all(data);
+                                        let _ = writer.flush();
+                                    }
+                                    Err(e) => {
+                                        eprintln!("attach: pty_writer lock poisoned: {}", e);
+                                        running = false;
+                                    }
                                 }
                                 if let Some(ref mut rec) = session.recording {
                                     rec.record_in(data);

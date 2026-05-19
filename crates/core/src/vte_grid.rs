@@ -13,6 +13,8 @@ pub struct VteGrid {
     grid: Vec<Vec<Cell>>,
     cursor_row: usize,
     cursor_col: usize,
+    /// Persistent parser: preserves mid-sequence state across multiple process() calls.
+    parser: vte::Parser,
 }
 
 #[derive(Clone, Debug)]
@@ -36,12 +38,15 @@ impl VteGrid {
             grid: new_grid(rows, cols),
             cursor_row: 0,
             cursor_col: 0,
+            parser: vte::Parser::new(),
         }
     }
 
     /// Feed raw PTY output bytes into the VTE parser.
+    ///
+    /// The parser is persistent across calls so that escape sequences
+    /// split across multiple feed() calls are handled correctly.
     pub fn process(&mut self, bytes: &[u8]) {
-        let mut parser = vte::Parser::new();
         let mut performer = GridPerformer {
             rows: self.rows,
             cols: self.cols,
@@ -50,7 +55,7 @@ impl VteGrid {
             cursor_col: self.cursor_col,
         };
         for &byte in bytes {
-            parser.advance(&mut performer, byte);
+            self.parser.advance(&mut performer, byte);
         }
         self.cursor_row = performer.cursor_row;
         self.cursor_col = performer.cursor_col;
@@ -316,5 +321,42 @@ mod tests {
         grid.resize(40, 120);
         assert_eq!(grid.rows, 40);
         assert_eq!(grid.cols, 120);
+    }
+
+    /// Escape sequence split across two process() calls must be handled
+    /// correctly because the parser is persistent (not re-created per call).
+    #[test]
+    fn escape_sequence_split_across_calls() {
+        let mut grid = VteGrid::new(24, 80);
+        // ESC [ 3 1 m sets red foreground — split after ESC
+        grid.process(b"\x1b");
+        grid.process(b"[31mX\x1b[0m");
+        // The 'X' should appear on the screen regardless of the split.
+        // If the parser were reset on each call the ESC byte would be lost
+        // and subsequent bytes would be printed as literals.
+        let screen = grid.screen();
+        assert!(
+            screen[0].contains('X'),
+            "character after split escape should be rendered: {:?}",
+            screen[0]
+        );
+    }
+
+    /// Cursor position command split across two calls.
+    #[test]
+    fn cursor_position_split_across_calls() {
+        let mut grid = VteGrid::new(24, 80);
+        grid.process(b"ABCDE");
+        // ESC [ 1 ; 1 H = cursor home — split mid-sequence
+        grid.process(b"\x1b[");
+        grid.process(b"1;1H");
+        grid.process(b"Z");
+        let screen = grid.screen();
+        // 'Z' should overwrite position (0,0) = 'A'
+        assert_eq!(
+            &screen[0][..1], "Z",
+            "cursor home + write should place Z at col 0: {:?}",
+            screen[0]
+        );
     }
 }
