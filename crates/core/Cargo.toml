@@ -16,7 +16,6 @@ alacritty_terminal = { workspace = true }
 log = { workspace = true }
 base64 = { workspace = true }
 shellexpand = "2"
-shell-words = "1"
 libc = "0.2"
 
 [dev-dependencies]

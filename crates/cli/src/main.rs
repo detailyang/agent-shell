@@ -18,21 +18,14 @@ enum Commands {
     /// Create a new PTY session.
     ///
     /// Examples:
-    ///   agent-shell create                      # start default shell
-    ///   agent-shell create -c "vim Cargo.toml"  # start vim directly
-    ///   agent-shell create -c "echo hello"      # run echo (exits immediately)
+    ///   agent-shell create                          # start default shell
+    ///   agent-shell create --shell /bin/zsh          # start zsh
     Create {
         #[arg(long)]
         name: Option<String>,
-        /// Command to run, parsed with POSIX word-splitting and exec'd directly.
-        /// e.g.  -c "vim Cargo.toml"  ->  exec vim Cargo.toml
-        ///       -c "echo hello"      ->  exec echo hello
-        /// No shell wrapper — the first word is the executable.
-        #[arg(short = 'c')]
-        cmd: Option<String>,
-        /// Executable to launch directly (hidden; use -c for commands).
-        /// Kept for backwards-compatibility with scripts that used --shell.
-        #[arg(long = "shell", hide = true)]
+        /// Executable to launch (e.g. /bin/bash, /bin/zsh).
+        /// Defaults to the configured default_program.
+        #[arg(long = "shell")]
         shell: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
@@ -261,7 +254,7 @@ async fn main() {
 
 fn command_to_request(cmd: Commands) -> Request {
     match cmd {
-        Commands::Create { name, cmd, shell, cwd, envs, prompt, rows, cols, buffer_size, record } => {
+        Commands::Create { name, shell, cwd, envs, prompt, rows, cols, buffer_size, record } => {
             let env = envs.map(|pairs| {
                 let mut map = std::collections::HashMap::new();
                 for pair in pairs {
@@ -272,22 +265,7 @@ fn command_to_request(cmd: Commands) -> Request {
                 map
             });
 
-            // Priority: -c > --shell (compat) > None
-            //   -c "vim Cargo.toml"  -> shell_words::split -> ["vim", "Cargo.toml"]  (direct exec)
-            //   --shell /bin/zsh     -> ["/bin/zsh"]  (compat, hidden)
-            //   (neither)            -> None  (daemon uses default_program, i.e. bash)
-            let args: Option<Vec<String>> = if let Some(c) = cmd {
-                match shell_words::split(&c) {
-                    Ok(words) if !words.is_empty() => Some(words),
-                    Ok(_) => None,
-                    Err(e) => {
-                        eprintln!("Error: -c parse failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                shell.map(|s| vec![s])
-            };
+            let args: Option<Vec<String>> = shell.map(|s| vec![s]);
 
             Request::Create {
                 name,
@@ -783,11 +761,10 @@ fn kill_daemon(config: &Config) -> Result<bool, String> {
 mod tests {
     use super::*;
 
-    fn make_create(cmd: Option<&str>) -> Request {
+    fn make_create(shell: Option<&str>) -> Request {
         command_to_request(Commands::Create {
             name: None,
-            cmd: cmd.map(|s| s.to_string()),
-            shell: None,
+            shell: shell.map(|s| s.to_string()),
             cwd: None,
             envs: None,
             prompt: None,
@@ -799,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn no_cmd_passes_none_args() {
+    fn no_shell_passes_none_args() {
         // agent-shell create  ->  daemon uses default_program
         match make_create(None) {
             Request::Create { args, program, .. } => {
@@ -811,22 +788,11 @@ mod tests {
     }
 
     #[test]
-    fn cmd_word_splits_into_argv() {
-        // agent-shell create -c "vim Cargo.toml"  ->  ["vim", "Cargo.toml"]
-        match make_create(Some("vim Cargo.toml")) {
+    fn shell_becomes_single_argv() {
+        // agent-shell create --shell /bin/zsh  ->  ["/bin/zsh"]
+        match make_create(Some("/bin/zsh")) {
             Request::Create { args, .. } => {
-                assert_eq!(args, Some(vec!["vim".to_string(), "Cargo.toml".to_string()]));
-            }
-            _ => panic!("expected Create"),
-        }
-    }
-
-    #[test]
-    fn cmd_single_word_is_single_argv() {
-        // agent-shell create -c "bash"  ->  ["bash"]
-        match make_create(Some("bash")) {
-            Request::Create { args, .. } => {
-                assert_eq!(args, Some(vec!["bash".to_string()]));
+                assert_eq!(args, Some(vec!["/bin/zsh".to_string()]));
             }
             _ => panic!("expected Create"),
         }
