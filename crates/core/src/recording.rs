@@ -48,7 +48,14 @@ impl Recording {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Use create_new to avoid appending to a stale file from a prior run that
+        // happened to reuse the same 8-char session ID.  If the file already exists
+        // we truncate it so the header is always line 1 of a fresh recording.
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
         Ok(Recording { file })
     }
 
@@ -209,8 +216,10 @@ pub fn filter_query_sequences(buf: &[u8]) -> Vec<u8> {
                 i += 2 + rel + 2; // skip DCS + ST
                 continue;
             }
-            // No ST found — skip to end of buffer (malformed but safe).
-            break;
+            // No ST found — malformed DCS. Skip just the two-byte ESC P header
+            // and continue scanning so subsequent bytes are not silently dropped.
+            i += 2;
+            continue;
         }
         out.push(buf[i]);
         i += 1;
@@ -435,9 +444,9 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
     // Collect the remainder into RecordingEvents.  If the first line was NOT
     // a header, put it back by chaining it with the rest.
     let event_lines: Box<dyn Iterator<Item = String>> = if header.is_some() {
-        Box::new(lines.filter_map(|l| l.ok()))
+        Box::new(lines.map_while(Result::ok))
     } else {
-        let rest = lines.filter_map(|l| l.ok());
+        let rest = lines.map_while(Result::ok);
         match first_line {
             Some(fl) => Box::new(std::iter::once(fl).chain(rest)),
             None => Box::new(rest),
@@ -920,5 +929,71 @@ mod tests {
 
         // Group 1 is the separate frame.
         assert_eq!(groups[1], b"world");
+    }
+
+    // ─── filter_query_sequences: malformed DCS ────────────────────────────
+
+    /// A DCS sequence without a String Terminator (\x1b\\) must NOT silently
+    /// drop the bytes that follow it.  Before the fix the loop broke out of the
+    /// while-loop entirely, discarding every subsequent byte.
+    #[test]
+    fn filter_malformed_dcs_does_not_drop_trailing_bytes() {
+        // Malformed DCS (no ST), followed by a normal byte sequence.
+        let input = b"before\x1bPno-terminator-hereafter";
+        let out = filter_query_sequences(input);
+        // "before" must survive; the ESC P prefix is skipped (2 bytes),
+        // and then "no-terminator-hereafter" must follow.
+        assert!(out.starts_with(b"before"), "'before' must be kept");
+        assert!(
+            out.ends_with(b"no-terminator-hereafter"),
+            "bytes after malformed DCS must not be silently dropped: got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    // ─── Recording::new: truncation on existing file ─────────────────────────
+
+    /// If a recording file already exists (e.g. from a prior session that
+    /// happened to share the same 8-char ID), opening it must TRUNCATE the old
+    /// content so the header is always line 1.  The old append-mode behaviour
+    /// would push the header onto line 2+, breaking replay.
+    #[test]
+    fn recording_truncates_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trunc_test.jsonl");
+
+        // First recording: write some stale data.
+        {
+            let mut rec = Recording::new(path.clone()).unwrap();
+            rec.write_header(24, 80, "bash");
+            rec.record_out(b"stale data");
+        }
+
+        // Second recording with the same path: must overwrite, not append.
+        {
+            let mut rec = Recording::new(path.clone()).unwrap();
+            rec.write_header(40, 120, "zsh");
+            rec.record_out(b"fresh data");
+        }
+
+        let f = File::open(&path).unwrap();
+        let lines: Vec<String> = BufReader::new(f)
+            .lines()
+            .map(|l| l.unwrap())
+            .collect();
+
+        // Must be exactly 2 lines: header + one event.
+        assert_eq!(lines.len(), 2, "should have exactly 2 lines (header + data), got {}: {:?}", lines.len(), lines);
+
+        let header: RecordingHeader = serde_json::from_str(&lines[0])
+            .expect("first line must be a RecordingHeader");
+        assert_eq!(header.dir, "meta", "first line must be meta header");
+        assert_eq!(header.rows, 40, "should reflect the new session dimensions");
+        assert_eq!(header.cols, 120);
+        assert_eq!(header.program, "zsh");
+
+        // The stale data must NOT appear anywhere.
+        let all = lines.join("\n");
+        assert!(!all.contains("stale"), "stale data must not appear in truncated file");
     }
 }

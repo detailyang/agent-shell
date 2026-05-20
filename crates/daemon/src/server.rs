@@ -291,9 +291,21 @@ async fn handle_create(
             }
 
             // Insert session into map first so the reaper / shutdown tasks
-            // can see it immediately.
+            // can see it immediately.  Guard against the (extremely unlikely)
+            // 32-bit session-ID collision: if the ID already exists, the old
+            // session would be silently replaced and its PTY process orphaned.
             {
                 let mut s = state.lock().await;
+                if s.sessions.contains_key(&id) {
+                    // 32-bit session-ID collision (exceedingly rare but possible).
+                    // Kill the newly spawned child so it doesn't become an orphan,
+                    // then report the error so the caller can retry.
+                    let mut collider = session;
+                    collider.force_kill();
+                    return Response::err(format!(
+                        "session id collision for '{}'; please retry", id
+                    ));
+                }
                 s.sessions.insert(id.clone(), session);
             } // lock released before sleep
 
@@ -1039,6 +1051,14 @@ async fn handle_mouse(
 }
 
 async fn handle_stop(state: Arc<Mutex<AppState>>) {
+    // Capture the actual socket path from config before we start tearing down.
+    let (socket_path, pid_path) = {
+        let s = state.lock().await;
+        let sp = s.config.socket_path();
+        let pp = Config::base_dir().join("daemon.pid");
+        (sp, pp)
+    };
+
     // Step 1: kill all sessions under lock
     {
         let mut s = state.lock().await;
@@ -1061,8 +1081,6 @@ async fn handle_stop(state: Arc<Mutex<AppState>>) {
     }
 
     // Clean up and exit directly (no response needed — we're shutting down)
-    let socket_path = Config::base_dir().join("daemon.sock");
-    let pid_path = Config::base_dir().join("daemon.pid");
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
 

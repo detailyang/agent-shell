@@ -35,6 +35,9 @@ pub struct Session {
     pub created_at: u64,  // Unix timestamp in seconds
     pub created_at_instant: Instant,  // For elapsed time calculations
     pub cwd: Option<PathBuf>,
+    /// Environment variables passed to the child at spawn time.
+    /// Stored here for inspection / debugging only; the child already has them.
+    /// Populated by Session::new after the child is spawned.
     pub env: HashMap<String, String>,
     pub rows: u16,
     pub cols: u16,
@@ -114,10 +117,11 @@ impl Session {
         if env.as_ref().map_or(true, |e| !e.contains_key("TERM")) {
             cmd.env("TERM", "xterm-256color");
         }
-        if let Some(env) = env {
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
+        // Apply user-provided env vars to the child and keep a copy in the session
+        // struct so callers can inspect the effective environment later.
+        let stored_env = env.unwrap_or_default();
+        for (k, v) in &stored_env {
+            cmd.env(k, v);
         }
 
         let child = pair
@@ -205,7 +209,7 @@ impl Session {
                 .as_secs(),
             created_at_instant: Instant::now(),
             cwd,
-            env: HashMap::new(),
+            env: stored_env,
             rows,
             cols,
             buffer_size,
