@@ -2534,6 +2534,177 @@ mod replay {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("hello"), "should still output valid events");
     }
+
+    /// `replay` must respond to SIGINT within a short window and exit cleanly.
+    ///
+    /// We use `--speed 0.01` (100x slower than real-time) to make the replay
+    /// take effectively forever, then send SIGINT after 1.5 s and assert the
+    /// process exits within 200 ms of receiving the signal.
+    #[test]
+    fn replay_exits_on_sigint() {
+        use std::time::{Duration, Instant};
+
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "sigint_rec", "--record"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+        let recording_path = resp.recording.clone().expect("should have recording path");
+
+        // Produce at least two well-separated events so the replay loop
+        // actually reaches a long inter-event sleep.
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "3000", "echo line1"]);
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "3000", "echo line2"]);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+
+        // Verify the recording file exists and has content.
+        assert!(
+            std::path::Path::new(&recording_path).exists(),
+            "recording file must exist"
+        );
+
+        let cli_bin = agent_shell_e2e::find_bin("agent-shell");
+
+        // Spawn replay at 0.01x speed (will take ~minutes to finish naturally).
+        let mut child = std::process::Command::new(&cli_bin)
+            .args(&["replay", &recording_path, "--speed", "0.01"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("replay should spawn");
+
+        // Let it run for 1.5 s, then send SIGINT.
+        std::thread::sleep(Duration::from_millis(1500));
+        unsafe { libc::kill(child.id() as i32, libc::SIGINT); }
+
+        // The process must exit within 500 ms of receiving SIGINT.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let exited = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break true,
+                None if Instant::now() >= deadline => break false,
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("replay did not exit within 500 ms of SIGINT — inter-frame sleep is not interruptible");
+        }
+    }
+
+    /// `replay` must exit when its stdin pipe is closed (EOF = Ctrl-D equivalent).
+    ///
+    /// We pipe an immediately-closed stdin into replay; the stdin-watcher
+    /// thread must detect the EOF and set the interrupted flag.
+    #[test]
+    fn replay_exits_on_stdin_eof() {
+        use std::time::{Duration, Instant};
+        use std::process::Stdio;
+
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "eof_rec", "--record"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+        let recording_path = resp.recording.clone().expect("should have recording path");
+
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "3000", "echo eof_line1"]);
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "3000", "echo eof_line2"]);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+
+        assert!(std::path::Path::new(&recording_path).exists());
+
+        let cli_bin = agent_shell_e2e::find_bin("agent-shell");
+
+        // Spawn replay with stdin=null (immediate EOF) at 0.01x speed.
+        let mut child = std::process::Command::new(&cli_bin)
+            .args(&["replay", &recording_path, "--speed", "0.01"])
+            .stdin(Stdio::null())    // ← EOF on first read
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("replay should spawn");
+
+        // Must exit within 500 ms (stdin EOF detected within one poll cycle).
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let exited = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break true,
+                None if Instant::now() >= deadline => break false,
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("replay did not exit on stdin EOF within 500 ms");
+        }
+    }
+
+    /// `replay` must exit when 0x04 (Ctrl-D byte) arrives via a pipe.
+    ///
+    /// We send the 0x04 byte after a delay to verify the watcher detects it
+    /// mid-replay, not just at startup.
+    #[test]
+    fn replay_exits_on_ctrl_d_byte_in_pipe() {
+        use std::time::{Duration, Instant};
+        use std::process::Stdio;
+        use std::io::Write;
+
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "ctrldrec", "--record"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+        let recording_path = resp.recording.clone().expect("should have recording path");
+
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "3000", "echo cd_line1"]);
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "3000", "echo cd_line2"]);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+
+        assert!(std::path::Path::new(&recording_path).exists());
+
+        let cli_bin = agent_shell_e2e::find_bin("agent-shell");
+
+        let mut child = std::process::Command::new(&cli_bin)
+            .args(&["replay", &recording_path, "--speed", "0.01"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("replay should spawn");
+
+        // Write Ctrl-D after 1 s.
+        let mut stdin = child.stdin.take().unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+        let _ = stdin.write_all(&[0x04]);
+        drop(stdin);
+
+        // Must exit within 500 ms of receiving 0x04.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let exited = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break true,
+                None if Instant::now() >= deadline => break false,
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("replay did not exit within 500 ms of receiving 0x04 (Ctrl-D)");
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3149,6 +3320,141 @@ mod send_timeout {
         assert!(resp.output.unwrap_or_default().contains("timeout_ok"));
 
         daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  destroy without --session (TUI picker path)
+// ═══════════════════════════════════════════════════════════════════
+
+mod destroy_picker {
+    use super::*;
+
+    /// When `destroy` is called without `--session` and stdin is not a terminal,
+    /// it must NOT hang waiting for picker input.  Instead it prints the session
+    /// list to stderr and exits 0.
+    #[test]
+    fn destroy_no_session_non_tty_stdin_exits_gracefully() {
+        let mut daemon = start_daemon();
+
+        // Create two sessions so the fallback list has something to show.
+        let r1 = daemon.cli_json(&["create", "--name", "picker_a"]);
+        assert_ok(&r1);
+        let r2 = daemon.cli_json(&["create", "--name", "picker_b"]);
+        assert_ok(&r2);
+
+        // Run `destroy` with no --session and stdin=null (non-tty).
+        // Must complete quickly (< 3 s) and exit 0.
+        let output = std::process::Command::new(&daemon.cli_bin)
+            .args(&["destroy"])
+            .env("AGENT_SHELL_HOME", daemon.temp_dir_path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("destroy should run");
+
+        assert!(
+            output.status.success(),
+            "destroy without --session (non-tty) should exit 0, got: {}",
+            output.status
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Specify a session with"),
+            "stderr should hint at --session flag, got: {:?}", stderr
+        );
+        assert!(
+            stderr.contains("picker_a") || stderr.contains("picker_b"),
+            "stderr should list session names, got: {:?}", stderr
+        );
+
+        // Both sessions must still be alive (we didn’t destroy anything).
+        let list = daemon.cli_json(&["list"]);
+        assert_ok(&list);
+        let sessions = list.sessions.unwrap_or_default();
+        let names: Vec<_> = sessions.iter().filter_map(|s| s.name.as_deref()).collect();
+        assert!(names.contains(&"picker_a"), "picker_a should still exist");
+        assert!(names.contains(&"picker_b"), "picker_b should still exist");
+
+        daemon.stop();
+    }
+
+    /// When `destroy` is called without `--session` and there are no sessions at
+    /// all, it must exit 0 with a helpful message.
+    #[test]
+    fn destroy_no_session_no_sessions_exits_gracefully() {
+        let daemon = start_daemon();
+
+        let output = std::process::Command::new(&daemon.cli_bin)
+            .args(&["destroy"])
+            .env("AGENT_SHELL_HOME", daemon.temp_dir_path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("destroy should run");
+
+        assert!(
+            output.status.success(),
+            "destroy with no sessions should exit 0"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No sessions"),
+            "should report no sessions, got: {:?}", stderr
+        );
+    }
+
+    /// `destroy --session <id>` (explicit) must still work as before.
+    #[test]
+    fn destroy_explicit_session_works() {
+        let mut daemon = start_daemon();
+
+        let resp = daemon.cli_json(&["create", "--name", "explicit_dest"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&["destroy", "--session", &sid]);
+        assert_ok(&resp);
+        assert_eq!(resp.session_id.as_deref(), Some(sid.as_str()));
+
+        // Should be gone from list.
+        let list = daemon.cli_json(&["list"]);
+        let sessions = list.sessions.unwrap_or_default();
+        assert!(
+            !sessions.iter().any(|s| s.id == sid),
+            "destroyed session should not appear in list"
+        );
+
+        daemon.stop();
+    }
+
+    /// `destroy` without `--session` can also target exited sessions.
+    /// (include_exited=true ensures they appear in the fallback list)
+    #[test]
+    fn destroy_no_session_includes_exited_in_list() {
+        let mut daemon = start_daemon();
+
+        // Create a session and let it exit.
+        let resp = daemon.cli_json(&["create", "--name", "exited_picker"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--timeout", "5000", "exit"]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // The exited session should appear in the non-tty fallback list.
+        let output = std::process::Command::new(&daemon.cli_bin)
+            .args(&["destroy"])
+            .env("AGENT_SHELL_HOME", daemon.temp_dir_path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("destroy should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("exited_picker"),
+            "exited session should appear in the destroy picker list: {:?}", stderr
+        );
+
         daemon.stop();
     }
 }

@@ -12,6 +12,7 @@ dependencies = [
  "dialoguer",
  "libc",
  "nix 0.29.0",
+ "portable-pty",
  "regex",
  "serde",
  "serde_json",
@@ -34,23 +35,6 @@ dependencies = [
  "serde",
  "serde_json",
  "shellexpand",
- "tempfile",
- "tokio",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "agent-shell-daemon"
-version = "0.1.0"
-dependencies = [
- "agent-shell-core",
- "base64",
- "nix 0.29.0",
- "portable-pty",
- "regex",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "toml",

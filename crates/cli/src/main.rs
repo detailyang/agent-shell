@@ -1,3 +1,5 @@
+mod server;
+
 use agent_shell_core::config::Config;
 use agent_shell_core::protocol::{Request, Response};
 use agent_shell_core::terminal::{enter_raw_mode, terminal_size};
@@ -5,6 +7,28 @@ use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::watch;
+
+/// Global flag set by the signal handler (daemon mode only).
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sig_shutdown_handler(_sig: nix::libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+fn install_signal_handlers() {
+    let handler = nix::sys::signal::SigHandler::Handler(sig_shutdown_handler);
+    let action = nix::sys::signal::SigAction::new(
+        handler,
+        nix::sys::signal::SaFlags::SA_RESTART,
+        nix::sys::signal::SigSet::empty(),
+    );
+    unsafe {
+        let _ = nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGTERM, &action);
+        let _ = nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &action);
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "agent-shell", version, about = "AI agent PTY session manager")]
@@ -42,10 +66,11 @@ enum Commands {
         #[arg(long)]
         record: bool,
     },
-    /// Destroy a session
+    /// Destroy a session.
+    /// If --session is omitted and stdin is a terminal, shows an interactive picker.
     Destroy {
         #[arg(long, short)]
-        session: String,
+        session: Option<String>,
     },
     /// Send text or control character to a session
     Send {
@@ -152,10 +177,20 @@ enum Commands {
     Stop,
     /// Force-kill the daemon process (via PID file + SIGKILL)
     KillDaemon,
+    /// Run as background daemon (listens on Unix socket)
+    Daemon,
 }
 
 #[tokio::main]
 async fn main() {
+    // Daemon subcommand is detected before the tokio runtime runs its own
+    // signal machinery, so we install our signal handlers first when needed.
+    // We peek at argv directly to avoid running Clap before handlers are set.
+    if std::env::args().nth(1).as_deref() == Some("daemon") {
+        run_daemon().await;
+        return;
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -174,7 +209,7 @@ async fn main() {
             let session_id = match session {
                 Some(id) => id,
                 None => {
-                    match pick_session(&socket_path).await {
+                    match pick_session(&socket_path, false, "attach").await {
                         Ok(Some(id)) => id,
                         Ok(None) => return, // user cancelled
                         Err(e) => {
@@ -199,6 +234,45 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::Destroy { session } => {
+            let config = Config::load();
+            let socket_path = config.socket_path();
+
+            // Resolve session ID: if omitted, show interactive picker.
+            // include_exited=true so users can destroy already-exited sessions
+            // that still occupy a slot in the daemon's session map.
+            let session_id = match session {
+                Some(id) => id,
+                None => {
+                    match pick_session(&socket_path, true, "destroy").await {
+                        Ok(Some(id)) => id,
+                        Ok(None) => return, // user cancelled or no sessions
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+
+            let req = Request::Destroy { session_id };
+            let resp = match send_request(&socket_path, &req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!("{}", serde_json::to_string(&resp).unwrap());
+            if !resp.ok {
+                std::process::exit(1);
+            }
+        }
+        Commands::Daemon => {
+            // Reached only if the user explicitly runs `agent-shell daemon`
+            // after the tokio runtime is already up. Redirect to the same path.
+            run_daemon().await;
         }
         Commands::KillDaemon => {
             let config = Config::load();
@@ -280,7 +354,11 @@ fn command_to_request(cmd: Commands) -> Request {
                 record: if record { Some(true) } else { None },
             }
         }
-        Commands::Destroy { session } => Request::Destroy { session_id: session },
+        Commands::Destroy { session } => Request::Destroy {
+            // session is always Some here: the None case is handled in main()
+            // before command_to_request is called.
+            session_id: session.unwrap_or_default(),
+        },
         Commands::Send { session, text, ctrl, nowait, timeout, client_id } => Request::Send {
             session_id: session,
             text: text.unwrap_or_default(),
@@ -322,20 +400,22 @@ fn command_to_request(cmd: Commands) -> Request {
         },
         Commands::Stop => Request::Stop,
         Commands::KillDaemon => unreachable!("KillDaemon is handled locally, never sent via socket"),
+        Commands::Daemon => unreachable!("Daemon is handled before command_to_request is called"),
         Commands::Replay { .. } => unreachable!(),
     }
 }
 
 // ─── Normal (non-streaming) command ──────────────────────────────────
 
-async fn connect_and_send(socket_path: &PathBuf, cmd: &Commands) -> Result<Response, String> {
-    let req = command_to_request(cmd.clone());
-
+/// Send a single `Request` to the daemon and return its `Response`.
+/// Does not auto-start the daemon; callers that want auto-start should
+/// use `connect_and_send` instead.
+async fn send_request(socket_path: &PathBuf, req: &Request) -> Result<Response, String> {
     let mut stream = tokio::net::UnixStream::connect(socket_path)
         .await
         .map_err(|e| format!("connect: {}", e))?;
 
-    let data = serde_json::to_vec(&req).map_err(|e| format!("serialize: {}", e))?;
+    let data = serde_json::to_vec(req).map_err(|e| format!("serialize: {}", e))?;
     let len = data.len() as u32;
     stream.write_all(&len.to_be_bytes()).await.map_err(|e| format!("write: {}", e))?;
     stream.write_all(&data).await.map_err(|e| format!("write: {}", e))?;
@@ -350,6 +430,11 @@ async fn connect_and_send(socket_path: &PathBuf, cmd: &Commands) -> Result<Respo
     stream.read_exact(&mut buf).await.map_err(|e| format!("read: {}", e))?;
 
     serde_json::from_slice(&buf).map_err(|e| format!("deserialize: {}", e))
+}
+
+async fn connect_and_send(socket_path: &PathBuf, cmd: &Commands) -> Result<Response, String> {
+    let req = command_to_request(cmd.clone());
+    send_request(socket_path, &req).await
 }
 
 // ─── Session picker TUI ──────────────────────────────────────────────
@@ -394,30 +479,49 @@ async fn fetch_sessions(socket_path: &PathBuf) -> Result<Vec<agent_shell_core::p
 }
 
 /// Show an interactive session picker and return the selected session ID.
+///
+/// `include_exited`: when true, exited sessions are also shown (used by destroy).
+/// `command_hint`:   name of the flag to use when stdin is not a terminal
+///                   (shown in the fallback error message).
+///
 /// Returns Ok(None) if the user cancels (Esc/Ctrl-C) or there are no sessions.
-async fn pick_session(socket_path: &PathBuf) -> Result<Option<String>, String> {
+async fn pick_session(
+    socket_path: &PathBuf,
+    include_exited: bool,
+    command_hint: &str,
+) -> Result<Option<String>, String> {
     let sessions = fetch_sessions(socket_path).await?;
 
-    // Filter to active (non-exited) sessions
-    let active: Vec<_> = sessions.into_iter().filter(|s| !s.exited).collect();
-    if active.is_empty() {
-        eprintln!("No active sessions. Create one with: agent-shell create");
-        return Ok(None);
-    }
+    let candidates: Vec<_> = if include_exited {
+        sessions
+    } else {
+        sessions.into_iter().filter(|s| !s.exited).collect()
+    };
 
-    // Interactive picker — requires a terminal
-    if !std::io::stdin().is_terminal() {
-        eprintln!("{} session(s) available but stdin is not a terminal.", active.len());
-        eprintln!("Specify a session with: agent-shell attach --session <ID>");
-        eprintln!("\nActive sessions:");
-        for s in &active {
-            eprintln!("  {}  {}", s.id, session_label(s));
+    if candidates.is_empty() {
+        if include_exited {
+            eprintln!("No sessions found.");
+        } else {
+            eprintln!("No active sessions. Create one with: agent-shell create");
         }
         return Ok(None);
     }
 
-    // Build selection items
-    let items: Vec<String> = active.iter().map(|s| session_label(s)).collect();
+    // Interactive picker requires a terminal on stdin.
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "{} session(s) available but stdin is not a terminal.",
+            candidates.len()
+        );
+        eprintln!("Specify a session with: agent-shell {} --session <ID>", command_hint);
+        eprintln!("\nSessions:");
+        for s in &candidates {
+            eprintln!("  {}", session_label(s));
+        }
+        return Ok(None);
+    }
+
+    let items: Vec<String> = candidates.iter().map(|s| session_label(s)).collect();
 
     let selection = dialoguer::Select::new()
         .with_prompt("Select session")
@@ -427,8 +531,8 @@ async fn pick_session(socket_path: &PathBuf) -> Result<Option<String>, String> {
         .map_err(|e| format!("picker: {}", e))?;
 
     match selection {
-        Some(idx) => Ok(Some(active[idx].id.clone())),
-        None => Ok(None), // user cancelled
+        Some(idx) => Ok(Some(candidates[idx].id.clone())),
+        None => Ok(None),
     }
 }
 
@@ -649,8 +753,9 @@ async fn auto_start_daemon(socket_path: &PathBuf) -> Result<(), String> {
         // Socket file exists but no daemon — stale artifact, safe to remove
         let _ = std::fs::remove_file(socket_path);
     }
-    let daemon_bin = find_daemon_binary()?;
-    std::process::Command::new(&daemon_bin)
+    let self_bin = find_self_binary()?;
+    std::process::Command::new(&self_bin)
+        .arg("daemon")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -669,24 +774,10 @@ async fn auto_start_daemon(socket_path: &PathBuf) -> Result<(), String> {
     Err("daemon failed to start".into())
 }
 
-fn find_daemon_binary() -> Result<String, String> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let path = dir.join("agent-shell-daemon");
-            if path.exists() {
-                return Ok(path.to_string_lossy().to_string());
-            }
-        }
-    }
-    if let Ok(output) = std::process::Command::new("which").arg("agent-shell-daemon").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(path);
-            }
-        }
-    }
-    Err("agent-shell-daemon not found in PATH or next to agent-shell".into())
+fn find_self_binary() -> Result<String, String> {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| format!("cannot determine own executable path: {}", e))
 }
 
 // ─── Force-kill daemon (bypasses socket) ─────────────────────────────
@@ -755,6 +846,43 @@ fn kill_daemon(config: &Config) -> Result<bool, String> {
     let _ = std::fs::remove_file(&pid_path);
 
     Ok(true)
+}
+
+// ─── Daemon entry point ─────────────────────────────────────────────
+
+async fn run_daemon() {
+    let config = Config::load();
+    let base_dir = Config::base_dir();
+    let _ = std::fs::create_dir_all(&base_dir);
+
+    install_signal_handlers();
+
+    let pid_path = base_dir.join("daemon.pid");
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let shutdown_trigger = shutdown_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+                let _ = shutdown_trigger.send(true);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+
+    let socket_path = config.socket_path();
+    let socket_path_for_cleanup = socket_path.clone();
+    let pid_path_for_cleanup = pid_path.clone();
+
+    if let Err(e) = server::run(socket_path, config, shutdown_rx).await {
+        eprintln!("daemon error: {}", e);
+    }
+
+    let _ = std::fs::remove_file(&socket_path_for_cleanup);
+    let _ = std::fs::remove_file(&pid_path_for_cleanup);
 }
 
 #[cfg(test)]

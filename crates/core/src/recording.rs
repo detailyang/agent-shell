@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::term_emulator::TermEmulator;
-use crate::terminal::enter_raw_mode;
+use crate::terminal::{enter_raw_mode_keep_signals, SigactionGuard};
 
 /// Metadata header written as the first line of a recording file.
 /// Identifies the terminal geometry and program at session creation time.
@@ -432,6 +432,9 @@ pub fn remap_coordinates(buf: &[u8], row_offset: u16, col_offset: u16) -> Vec<u8
 }
 
 fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     // Load all lines, split header from data events.
     let mut lines = reader.lines();
 
@@ -483,7 +486,155 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
     // generate a full_redraw() frame for the client terminal.
     let mut emu = TermEmulator::new(rec_size.0, rec_size.1);
 
-    let _raw_guard = if is_tty { enter_raw_mode() } else { None };
+    // ── Signal handling ────────────────────────────────────────────────────
+    // Install a SIGINT handler that sets an atomic flag.  We use
+    // `enter_raw_mode_keep_signals` (not the full cfmakeraw) so the terminal
+    // still converts Ctrl-C into SIGINT.  The inter-frame sleep is split into
+    // short slices so the flag is checked frequently.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_flag = interrupted.clone();
+
+    // Static trampoline: the handler stores a pointer to the Arc's inner bool.
+    // We use a global atomic pointer rather than a closure because signal
+    // handlers must be async-signal-safe (no allocation, no locks).
+    static INTERRUPTED_PTR: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    INTERRUPTED_PTR.store(
+        Arc::as_ptr(&interrupted_flag) as usize,
+        Ordering::Release,
+    );
+
+    extern "C" fn sigint_handler(_: libc::c_int) {
+        let ptr = INTERRUPTED_PTR.load(std::sync::atomic::Ordering::Acquire);
+        if ptr != 0 {
+            // SAFETY: the pointer is valid for the duration of the replay
+            // (the Arc keeps it alive; we clear INTERRUPTED_PTR before drop).
+            unsafe { (*(ptr as *const AtomicBool)).store(true, Ordering::Release); }
+        }
+    }
+
+    // Install unconditionally — SIGINT via `kill -INT` works regardless of
+    // whether stdout is a tty.  The raw-mode / ISIG path only matters for
+    // Ctrl-C typed in an interactive terminal.
+    let _sigint_guard: Option<SigactionGuard> = {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+        let new_action = SigAction::new(
+            SigHandler::Handler(sigint_handler),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
+        );
+        // SAFETY: handler is async-signal-safe (single atomic store).
+        unsafe { sigaction(Signal::SIGINT, &new_action).ok() }
+            .map(|old| SigactionGuard { sig: Signal::SIGINT, old })
+    };
+
+    // Use the signals-preserving raw mode so Ctrl-C still sends SIGINT.
+    let _raw_guard = if is_tty { enter_raw_mode_keep_signals() } else { None };
+
+    // ── Ctrl-D / stdin-EOF watcher thread ─────────────────────────────────
+    // Ctrl-D is not a signal: the terminal driver converts it to an EOF
+    // condition on the TTY (read() returns 0), or the raw byte 0x04 arrives
+    // in the process's stdin buffer.  Neither path triggers SIGINT, so we
+    // need to actively read stdin.
+    //
+    // We do this on a dedicated background thread because the main thread
+    // holds stdout.lock() during replay and must not block on stdin.read().
+    // The thread polls stdin in non-blocking mode (10 ms sleep between polls)
+    // and sets `interrupted` on Ctrl-D / EOF / any read error.
+    //
+    // `replay_done` is a second flag the main thread sets when it finishes
+    // (naturally or via interruption) so the watcher thread can exit cleanly.
+    let replay_done = Arc::new(AtomicBool::new(false));
+    let stdin_watcher = {
+        let interrupted = interrupted.clone();
+        let replay_done = replay_done.clone();
+
+        std::thread::spawn(move || {
+            // Use poll(2) with a short timeout to wait for stdin readability
+            // WITHOUT setting O_NONBLOCK on the file description.
+            //
+            // Why not O_NONBLOCK?
+            // In a PTY environment (ssh, IDE terminal, `script`, agent-shell
+            // attach) fd 0 (stdin) and fd 1 (stdout) share the same open file
+            // description (same pty slave).  O_NONBLOCK is a property of the
+            // file description, not the fd, so setting it on fd 0 would also
+            // make writes on fd 1 non-blocking.  That causes `write_all` to
+            // the replay stdout to return EAGAIN (os error 35) when the kernel
+            // buffer is momentarily full.
+            //
+            // poll() only inspects readiness; it never changes any fd flag.
+            let mut pfd = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let mut buf = [0u8; 64];
+
+            loop {
+                if replay_done.load(Ordering::Acquire) { return; }
+
+                // Wait up to 20 ms for stdin to become readable.
+                // SAFETY: pfd is a valid, fully-initialised pollfd.
+                let ready = unsafe { libc::poll(&mut pfd, 1, 20) };
+
+                if ready < 0 {
+                    // poll() itself failed (e.g. EINTR from our SIGINT handler).
+                    // EINTR is harmless — just retry.  Any other error is
+                    // unexpected; treat as EOF to unblock the main thread.
+                    let err = unsafe { *libc::__error() };
+                    if err != libc::EINTR {
+                        interrupted.store(true, Ordering::Release);
+                        return;
+                    }
+                    continue;
+                }
+
+                if ready == 0 {
+                    // Timeout: no data yet, loop and re-check replay_done.
+                    continue;
+                }
+
+                // stdin is readable: do a single read.
+                // SAFETY: fd 0 is stdin, buf is a valid writable slice.
+                let n = unsafe {
+                    libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+
+                if n == 0 {
+                    // EOF — Ctrl-D on an empty TTY input buffer, or pipe closed.
+                    interrupted.store(true, Ordering::Release);
+                    return;
+                } else if n > 0 {
+                    // Got bytes: check for Ctrl-D byte (0x04).
+                    if buf[..n as usize].contains(&0x04) {
+                        interrupted.store(true, Ordering::Release);
+                        return;
+                    }
+                    // Any other key is ignored (replay is read-only).
+                } else {
+                    // n < 0: unexpected read error — treat as EOF.
+                    interrupted.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        })
+    };
+
+    // Interruptible sleep: break into 10 ms slices so the interrupted flag
+    // is polled at most 10 ms after SIGINT arrives.
+    let sleep_interruptible = |total_ms: u64, interrupted: &AtomicBool| -> bool {
+        const SLICE_MS: u64 = 10;
+        let mut remaining = total_ms;
+        while remaining > 0 {
+            if interrupted.load(Ordering::Acquire) {
+                return true; // interrupted
+            }
+            let this_slice = remaining.min(SLICE_MS);
+            std::thread::sleep(std::time::Duration::from_millis(this_slice));
+            remaining = remaining.saturating_sub(this_slice);
+        }
+        interrupted.load(Ordering::Acquire)
+    };
 
     // Replay loop.
     let stdout = std::io::stdout();
@@ -493,6 +644,11 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
     let result = (|| -> std::io::Result<()> {
         let mut i = 0;
         while i < events.len() {
+            // Check interrupt before every frame.
+            if interrupted.load(Ordering::Acquire) {
+                break;
+            }
+
             let event = &events[i];
 
             // Inter-event delay: sleep for the wall-clock gap since the last
@@ -501,7 +657,9 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
                 let raw_delta_ms = event.ts.saturating_sub(prev_ts);
                 let scaled_ms = (raw_delta_ms as f64 / speed) as u64;
                 if scaled_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(scaled_ms));
+                    if sleep_interruptible(scaled_ms, &interrupted) {
+                        break;
+                    }
                 }
             }
 
@@ -552,12 +710,23 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
         Ok(())
     })();
 
+    // Signal the stdin watcher thread to exit and wait for it.
+    // Must happen before dropping the `interrupted` Arc so the thread's
+    // clone of the Arc is the last reference to keep the flag alive.
+    replay_done.store(true, Ordering::Release);
+    let _ = stdin_watcher.join();
+
+    // Deactivate signal handler before dropping the Arc so the pointer
+    // stored in INTERRUPTED_PTR is no longer dereferenced.
+    INTERRUPTED_PTR.store(0, Ordering::Release);
+    drop(_sigint_guard); // restores previous SIGINT action (SIG_DFL)
+
     // Cleanup: restore alternate screen.
     if is_tty {
         let _ = out.write_all(b"\x1b[?1049l");
         let _ = out.write_all(b"\x1b[0m");
         let _ = out.flush();
-        // _raw_guard is dropped here, restoring termios via RAII.
+        // _raw_guard dropped here → termios restored via RAII.
     }
 
     result

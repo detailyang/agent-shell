@@ -5,6 +5,20 @@ pub struct RawModeGuard {
     original: nix::sys::termios::Termios,
 }
 
+/// RAII guard that restores a previously installed signal action on drop.
+pub struct SigactionGuard {
+    pub sig: nix::sys::signal::Signal,
+    pub old: nix::sys::signal::SigAction,
+}
+
+impl Drop for SigactionGuard {
+    fn drop(&mut self) {
+        // Restore the original SIGINT action (typically SIG_DFL).
+        // Ignore errors: we are in a destructor and cannot propagate.
+        unsafe { let _ = nix::sys::signal::sigaction(self.sig, &self.old); }
+    }
+}
+
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let stdin_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) };
@@ -26,6 +40,31 @@ pub fn enter_raw_mode() -> Option<RawModeGuard> {
     let original = nix::sys::termios::tcgetattr(&stdin_fd).ok()?;
     let mut raw = original.clone();
     nix::sys::termios::cfmakeraw(&mut raw);
+    nix::sys::termios::tcsetattr(&stdin_fd, nix::sys::termios::SetArg::TCSANOW, &raw).ok()?;
+    Some(RawModeGuard { original })
+}
+
+/// Like `enter_raw_mode` but keeps `ISIG` enabled so that Ctrl-C still
+/// delivers SIGINT to the process.  Replay uses this instead of the full
+/// `cfmakeraw` variant because it only needs to suppress local echo and
+/// canonical line-buffering; it must remain killable via Ctrl-C.
+///
+/// Specifically: clears `ICANON`, `ECHO`, `ECHOE`, `ECHOK`, `ECHONL`
+/// but leaves `ISIG` (and all other flags) intact.
+pub fn enter_raw_mode_keep_signals() -> Option<RawModeGuard> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return None;
+    }
+    let stdin_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) };
+    let original = nix::sys::termios::tcgetattr(&stdin_fd).ok()?;
+    let mut raw = original.clone();
+    // Only strip canonical mode and echo; leave ISIG so Ctrl-C → SIGINT works.
+    use nix::sys::termios::LocalFlags;
+    raw.local_flags &= !(LocalFlags::ICANON
+        | LocalFlags::ECHO
+        | LocalFlags::ECHOE
+        | LocalFlags::ECHOK
+        | LocalFlags::ECHONL);
     nix::sys::termios::tcsetattr(&stdin_fd, nix::sys::termios::SetArg::TCSANOW, &raw).ok()?;
     Some(RawModeGuard { original })
 }
