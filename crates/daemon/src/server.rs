@@ -674,9 +674,9 @@ async fn handle_read(
             Some(s) => s,
             None => return Response::err("session not found"),
         };
-        session.feed(); // Drain PTY output first so VTE grid is up-to-date
-        let screen_data = session.vte_grid.screen();
-        let cursor = session.vte_grid.cursor();
+        session.feed(); // Drain PTY output first so terminal state is up-to-date
+        let screen_data = session.term.screen();
+        let cursor = session.term.cursor();
         return Response {
             ok: true,
             screen: Some(screen_data),
@@ -1111,10 +1111,10 @@ async fn handle_attach(
         s.pty_output_notify.clone()
     };
     // ── Phase 1: validate & send initial JSON handshake ──────────────────
-    // Instead of using VteGrid full_redraw (which strips colors/attributes),
-    // we transmit the raw PTY output bytes from the ring buffer.
-    // The client's real terminal will interpret the escape sequences correctly.
-    let (raw_output, start_cursor, already_exited) = {
+    // Generate a full ANSI redraw from the terminal emulator state.
+    // This correctly handles alternate screen, SGR attributes, and avoids
+    // the ringbuf-overflow problem where raw bytes could be truncated.
+    let (redraw_output, start_cursor, already_exited) = {
         let mut s = state.lock().await;
         let session = match s.sessions.get_mut(&session_id) {
             Some(s) => s,
@@ -1133,18 +1133,18 @@ async fn handle_attach(
         let already_exited = session.exited.is_some();
         session.feed();
         let wc = session.ringbuf.write_cursor();
-        let (raw_bytes, _gap, _lost) = session.ringbuf.read(0);
-        (raw_bytes, wc, already_exited)
+        let redraw = session.term.full_redraw();
+        (redraw, wc, already_exited)
     };
 
-    // JSON response carries the raw PTY output.
+    // JSON response carries the terminal redraw output.
     // We use base64 encoding to safely transport binary data through JSON
     // without corrupting escape sequences via lossy UTF-8 conversion.
     let init_resp = Response {
         ok: true,
         output: Some(base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
-            &raw_output,
+            &redraw_output,
         )),
         ..Response::ok()
     };

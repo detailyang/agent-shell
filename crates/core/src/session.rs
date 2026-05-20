@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::recording::Recording;
 use crate::ringbuf::RingBuffer;
-use crate::vte_grid::VteGrid;
+use crate::term_emulator::TermEmulator;
 use nix::sys::signal::{self, Signal};
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
@@ -24,7 +24,7 @@ pub struct Session {
     pub pty_reader: Box<dyn std::io::Read + Send>,
     pub pty_writer: std::sync::Mutex<Box<dyn std::io::Write + Send>>,
     pub ringbuf: RingBuffer,
-    pub vte_grid: VteGrid,
+    pub term: TermEmulator,
     pub shell_pgid: i32,
     pub current_fg_pgid: i32,
     pub prompt_regex: Option<Regex>,
@@ -109,6 +109,11 @@ impl Session {
         }
         cmd.cwd(cwd.clone().unwrap_or_else(|| PathBuf::from(".")));
 
+        // Set default TERM if not provided by user
+        // This is required for vim and other TUI apps to render correctly
+        if env.as_ref().map_or(true, |e| !e.contains_key("TERM")) {
+            cmd.env("TERM", "xterm-256color");
+        }
         if let Some(env) = env {
             for (k, v) in env {
                 cmd.env(k, v);
@@ -160,11 +165,19 @@ impl Session {
             .take_writer()
             .map_err(|e| format!("failed to take writer: {}", e))?;
 
-        // Create recording if requested
+        // Create recording if requested.
+        // Write the metadata header immediately after opening so it is always
+        // the first line of the file, before any PTY output is captured.
         let recording = if record.unwrap_or(config.session.record_by_default) {
             let rec_dir = config.recording_dir();
             let rec_path = rec_dir.join(format!("{}.jsonl", id));
-            Recording::new(rec_path).ok()
+            match Recording::new(rec_path) {
+                Ok(mut rec) => {
+                    rec.write_header(rows, cols, &program_display);
+                    Some(rec)
+                }
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -178,7 +191,7 @@ impl Session {
             pty_reader,
             pty_writer: std::sync::Mutex::new(pty_writer),
             ringbuf: RingBuffer::new(buffer_size),
-            vte_grid: VteGrid::new(rows, cols),
+            term: TermEmulator::new(rows, cols),
             shell_pgid,
             current_fg_pgid: shell_pgid,
             prev_fg_pgid: shell_pgid,
@@ -204,7 +217,7 @@ impl Session {
         })
     }
 
-    /// Read available output from PTY master and write to ringbuf + vte_grid.
+    /// Read available output from PTY master and write to ringbuf + term emulator.
     /// The PTY reader fd should be set to non-blocking for this to work properly.
     pub fn feed(&mut self) -> usize {
         let mut buf = [0u8; 65536];
@@ -216,7 +229,7 @@ impl Session {
                 Ok(n) => {
                     let data = &buf[..n];
                     self.ringbuf.write(data);
-                    self.vte_grid.process(data);
+                    self.term.process(data);
                     if let Some(ref mut rec) = self.recording {
                         rec.record_out(data);
                     }
@@ -429,7 +442,7 @@ impl Session {
                 pixel_height: 0,
             })
             .map_err(|e| format!("resize failed: {}", e))?;
-        self.vte_grid.resize(rows, cols);
+        self.term.resize(rows, cols);
         self.rows = rows;
         self.cols = cols;
         Ok(())

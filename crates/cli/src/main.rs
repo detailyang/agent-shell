@@ -1,5 +1,6 @@
 use agent_shell_core::config::Config;
 use agent_shell_core::protocol::{Request, Response};
+use agent_shell_core::terminal::{enter_raw_mode, terminal_size};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -191,11 +192,14 @@ async fn main() {
                 }
             };
 
+            // Get client terminal size for sync
+            let (client_rows, client_cols) = terminal_size().unwrap_or((24, 80));
+
             let req = Request::Attach {
-                session_id,
+                session_id: session_id.clone(),
                 writable: if writable { Some(true) } else { None },
             };
-            match run_attach(&socket_path, req).await {
+            match run_attach(&socket_path, req, client_rows, client_cols).await {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -458,37 +462,66 @@ fn session_label(s: &agent_shell_core::protocol::SessionInfo) -> String {
 
 // ─── Attach: bidirectional raw streaming ─────────────────────────────
 
-/// RAII guard that restores the original terminal settings on drop.
-struct RawModeGuard {
-    original: nix::sys::termios::Termios,
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let stdin_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) };
-        let _ = nix::sys::termios::tcsetattr(
-            &stdin_fd,
-            nix::sys::termios::SetArg::TCSADRAIN,
-            &self.original,
-        );
+/// Remove DSR (Device Status Report, ESC[6n) sequences from a byte stream.
+/// These cause the client terminal to emit CPR responses that, in writable
+/// attach mode, get forwarded to the PTY and misinterpreted as keystrokes.
+fn strip_dsr(data: &[u8]) -> Vec<u8> {
+    const DSR: &[u8] = b"\x1b[6n";
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if i + DSR.len() <= data.len() && &data[i..i + DSR.len()] == DSR {
+            i += DSR.len();
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
     }
+    out
 }
 
-fn enter_raw_mode() -> Option<RawModeGuard> {
-    if !std::io::stdin().is_terminal() {
-        return None;
+/// Resize session via a separate connection (before attach enters binary mode).
+async fn resize_via_separate_connection(socket_path: &PathBuf, session_id: &str, rows: u16, cols: u16) -> Result<(), String> {
+    let mut stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| format!("resize connect: {}", e))?;
+    let resize_req = Request::Resize {
+        session_id: session_id.to_string(),
+        rows,
+        cols,
+    };
+    let data = serde_json::to_vec(&resize_req).map_err(|e| format!("serialize resize: {}", e))?;
+    let len = data.len() as u32;
+    stream.write_all(&len.to_be_bytes()).await.map_err(|e| format!("write resize: {}", e))?;
+    stream.write_all(&data).await.map_err(|e| format!("write resize: {}", e))?;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.map_err(|e| format!("read resize resp: {}", e))?;
+    let resp_len = u32::from_be_bytes(len_buf) as usize;
+    if resp_len > 16 * 1024 * 1024 {
+        return Err("resize response too large".into());
     }
-    let stdin_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) };
-    let original = nix::sys::termios::tcgetattr(&stdin_fd).ok()?;
-    let mut raw = original.clone();
-    nix::sys::termios::cfmakeraw(&mut raw);
-    nix::sys::termios::tcsetattr(&stdin_fd, nix::sys::termios::SetArg::TCSANOW, &raw).ok()?;
-    Some(RawModeGuard { original })
+    let mut buf = vec![0u8; resp_len];
+    stream.read_exact(&mut buf).await.map_err(|e| format!("read resize resp: {}", e))?;
+    Ok(())
 }
 
-
-async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
+async fn run_attach(socket_path: &PathBuf, req: Request, client_rows: u16, client_cols: u16) -> Result<(), String> {
     let readonly = !matches!(&req, Request::Attach { writable: Some(true), .. });
+    let session_id_for_resize = match &req {
+        Request::Attach { session_id, .. } => session_id.clone(),
+        _ => String::new(),
+    };
+
+    // ── Phase 0: resize session BEFORE attach (via separate connection) ──
+    // Attach enters binary-stream mode, so resize must happen on its own
+    // connection first. This ensures vim/TUI apps see the correct terminal
+    // size from the very first byte of output.
+    if !session_id_for_resize.is_empty() {
+        let _ = resize_via_separate_connection(
+            socket_path, &session_id_for_resize, client_rows, client_cols,
+        ).await;
+    }
 
     // Auto-start daemon if needed
     let mut stream = match tokio::net::UnixStream::connect(socket_path).await {
@@ -506,7 +539,8 @@ async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
         }
     };
 
-    // ── Phase 1: send request & read JSON handshake ────────────────
+    // ── Phase 1: send attach request & read JSON handshake ────────────────
+
     let data = serde_json::to_vec(&req).map_err(|e| format!("serialize: {}", e))?;
     let len = data.len() as u32;
     stream.write_all(&len.to_be_bytes()).await.map_err(|e| format!("write: {}", e))?;
@@ -535,7 +569,12 @@ async fn run_attach(socket_path: &PathBuf, req: Request) -> Result<(), String> {
     if let Some(output) = &resp.output {
         match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, output) {
             Ok(bytes) => {
-                let _ = std::io::stdout().write_all(&bytes);
+                // Strip DSR (Device Status Report = ESC[6n) as a safety measure.
+                // The server now sends a full_redraw snapshot from the terminal
+                // emulator, which should not contain DSR. But strip anyway in
+                // case of edge cases.
+                let filtered = strip_dsr(&bytes);
+                let _ = std::io::stdout().write_all(&filtered);
                 let _ = std::io::stdout().flush();
             }
             Err(_) => {
