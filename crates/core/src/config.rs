@@ -78,12 +78,17 @@ impl SessionConfig {
 pub struct RecordingConfig {
     #[serde(default = "RecordingConfig::default_dir")]
     pub dir: String,
+    /// Delete recording files older than this many days. Set to 0 or omit to
+    /// disable automatic cleanup. Default: 30 days.
+    #[serde(default = "RecordingConfig::default_retention_days")]
+    pub retention_days: u64,
 }
 
 impl Default for RecordingConfig {
     fn default() -> Self {
         RecordingConfig {
             dir: Self::default_dir(),
+            retention_days: Self::default_retention_days(),
         }
     }
 }
@@ -91,6 +96,9 @@ impl Default for RecordingConfig {
 impl RecordingConfig {
     fn default_dir() -> String {
         "~/.agent-shell/recordings".to_string()
+    }
+    fn default_retention_days() -> u64 {
+        30
     }
 }
 
@@ -197,6 +205,41 @@ default_shell = "/bin/zsh"
     fn load_missing_file() {
         let config = Config::load_from(PathBuf::from("/nonexistent/config.toml"));
         assert_eq!(config.session.default_buffer_size, 524288);
+    }
+
+    #[test]
+    fn recording_retention_days_default_and_override() {
+        // Default must be 30.
+        let cfg = Config::default();
+        assert_eq!(cfg.recording.retention_days, 30);
+
+        // User can set retention_days = 0 to disable cleanup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[recording]
+retention_days = 0
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(path);
+        assert_eq!(cfg.recording.retention_days, 0);
+
+        // User can override to a custom number of days.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("config.toml");
+        std::fs::write(
+            &path2,
+            r#"
+[recording]
+retention_days = 90
+"#,
+        )
+        .unwrap();
+        let cfg2 = Config::load_from(path2);
+        assert_eq!(cfg2.recording.retention_days, 90);
     }
 
     /// Test recording_dir behavior with AGENT_SHELL_HOME.

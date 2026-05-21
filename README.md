@@ -110,6 +110,29 @@ cp target/release/agent-shell /usr/local/bin/
 cargo install agent-shell
 ```
 
+### Install as a Claude Code skill
+
+The `skills/agent-shell/` directory contains a [Claude Code](https://claude.ai/code) skill
+that lets AI agents invoke `agent-shell` through the `Bash` tool with least-privilege
+`allowed-tools` restrictions.
+
+**User-level (available in all projects):**
+
+```bash
+cp -r skills/agent-shell ~/.claude/skills/
+```
+
+**Project-level (current project only):**
+
+```bash
+mkdir -p .claude/skills
+cp -r skills/agent-shell .claude/skills/
+```
+
+After copying, restart Claude Code or run `/skills` to confirm `agent-shell` appears in the
+skill list. The agent can then call `agent-shell <subcommand>` via the `Bash` tool under the
+permission set declared in `SKILL.md`.
+
 ---
 
 ## Quick Start
@@ -500,6 +523,27 @@ cp target/release/agent-shell /usr/local/bin/
 ```bash
 cargo install agent-shell
 ```
+
+### 安装为 Claude Code skill
+
+`skills/agent-shell/` 目录包含一个 [Claude Code](https://claude.ai/code) skill，
+让 AI agent 通过 `Bash` 工具以最小权限（`allowed-tools` 限制）调用 `agent-shell`。
+
+**用户级（对所有项目生效）：**
+
+```bash
+cp -r skills/agent-shell ~/.claude/skills/
+```
+
+**项目级（仅当前项目生效）：**
+
+```bash
+mkdir -p .claude/skills
+cp -r skills/agent-shell .claude/skills/
+```
+
+复制后重启 Claude Code 或执行 `/skills`，确认 `agent-shell` 出现在 skill 列表中。
+agent 即可通过 `Bash` 工具以 `SKILL.md` 中声明的权限集调用 `agent-shell <子命令>`。
 
 ---
 

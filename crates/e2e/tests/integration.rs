@@ -4826,6 +4826,155 @@ mod mouse {
         daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();
     }
+
+    // ── PTY round-trip tests ─────────────────────────────────────────────────
+    // The tests below verify that mouse sequences are *actually delivered to and
+    // echoed back by the PTY program*, not just that the daemon accepted the
+    // request.  Strategy:
+    //   1. Start a session running `cat` (which echoes every byte it receives).
+    //   2. Enable SGR mouse reporting in the PTY via printf so the terminal is
+    //      in mouse mode (programs that don't enable it would silently discard
+    //      the sequences, but cat passes them straight through).
+    //   3. Send the mouse command through the CLI.
+    //   4. Read the ring-buffer output and assert the expected SGR byte sequence
+    //      is present — proving the bytes traversed the full path:
+    //      CLI → daemon → PTY write → cat → PTY read → ring-buffer → CLI read.
+
+    // ── How PTY echo works here ────────────────────────────────────────────
+    // When the daemon writes SGR mouse bytes to the PTY slave, the PTY line
+    // discipline's ECHOCTL flag converts each 0x1b (ESC) to the two-byte
+    // sequence "^[" (0x5e 0x5b) before echoing it back to the PTY master.
+    // The ring-buffer therefore contains "^[" rather than a raw ESC byte.
+    // This is the expected, verifiable artifact of the PTY round-trip:
+    //   CLI mouse cmd → daemon PTY write → PTY ECHOCTL echo → ring-buffer → CLI read
+    // Asserting "^[[<btn;col;rowM/m" in the ring-buffer output is sufficient
+    // proof that the bytes traversed the full path.
+
+    #[test]
+    fn mouse_click_pty_roundtrip() {
+        // Why this matters: the existing click tests only verify the daemon
+        // returns ok:true. This test proves the SGR bytes actually reach the
+        // PTY (evidenced by ECHOCTL echo back through the ring-buffer).
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_click_rtt"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Keep bash's foreground process alive so the PTY slave fd stays open
+        // and ECHOCTL echo is active during the mouse write.
+        daemon.cli_json(&["send", "--session", &sid, "--nowait", "cat"]);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Send a left-click at col=10, row=5 via the CLI mouse command.
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "click", "--x", "10", "--y", "5",
+        ]);
+        assert_ok(&resp);
+
+        // Give PTY time to echo the bytes back into the ring-buffer.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Read all buffered output and assert both press and release are present
+        // in their ECHOCTL form: ESC -> "^[".
+        let resp = daemon.cli_json(&["read", "--session", &sid]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        let bytes = output.as_bytes();
+
+        // ECHOCTL form of SGR press  ESC[<0;10;5M  ->  ^[[<0;10;5M
+        assert_contains_escape(bytes, b"^[[<0;10;5M", "click press SGR roundtrip");
+        // ECHOCTL form of SGR release ESC[<0;10;5m  ->  ^[[<0;10;5m
+        assert_contains_escape(bytes, b"^[[<0;10;5m", "click release SGR roundtrip");
+
+        daemon.cli_json(&["send", "--session", &sid, "--ctrl", "c"]);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_scroll_pty_roundtrip() {
+        // Verifies scroll-up and scroll-down SGR sequences reach the PTY.
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_scroll_rtt"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        daemon.cli_json(&["send", "--session", &sid, "--nowait", "cat"]);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "scroll",
+            "--x", "5", "--y", "3", "--direction", "up",
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "scroll",
+            "--x", "5", "--y", "3", "--direction", "down",
+        ]);
+        assert_ok(&resp);
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let resp = daemon.cli_json(&["read", "--session", &sid]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        let bytes = output.as_bytes();
+
+        // ECHOCTL form: ESC[<64;5;3M (scroll-up, button code 64) -> ^[[<64;5;3M
+        assert_contains_escape(bytes, b"^[[<64;5;3M", "scroll-up SGR roundtrip");
+        // ECHOCTL form: ESC[<65;5;3M (scroll-down, button code 65) -> ^[[<65;5;3M
+        assert_contains_escape(bytes, b"^[[<65;5;3M", "scroll-down SGR roundtrip");
+
+        daemon.cli_json(&["send", "--session", &sid, "--ctrl", "c"]);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mouse_drag_pty_roundtrip() {
+        // Verifies drag emits a press, intermediate motion events, and a release
+        // — all reaching the PTY and echoed back through the ring-buffer.
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create", "--name", "mouse_drag_rtt"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        daemon.cli_json(&["send", "--session", &sid, "--nowait", "cat"]);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Drag from (1,1) to (10,1) with 3 intermediate steps.
+        let resp = daemon.cli_json(&[
+            "mouse", "--session", &sid, "drag",
+            "--x", "1", "--y", "1",
+            "--to-x", "10", "--to-y", "1",
+            "--steps", "3",
+        ]);
+        assert_ok(&resp);
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let resp = daemon.cli_json(&["read", "--session", &sid]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        let bytes = output.as_bytes();
+
+        // ECHOCTL form of press at (1,1): ESC[<0;1;1M -> ^[[<0;1;1M
+        assert_contains_escape(bytes, b"^[[<0;1;1M", "drag press SGR roundtrip");
+        // At least one motion event (button+32=32): ESC[<32;...M -> ^[[<32;...M
+        // Check for the ECHOCTL prefix since intermediate coordinates vary.
+        assert!(
+            bytes.windows(6).any(|w| w == b"^[[<32"),
+            "drag motion SGR roundtrip: expected motion sequence ^[[<32... not found in output: {:?}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(400)]),
+        );
+        // ECHOCTL form of release at (10,1): ESC[<0;10;1m -> ^[[<0;10;1m
+        assert_contains_escape(bytes, b"^[[<0;10;1m", "drag release SGR roundtrip");
+
+        daemon.cli_json(&["send", "--session", &sid, "--ctrl", "c"]);
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
 }
 
 // ── vim e2e tests ─────────────────────────────────────────────────────────────

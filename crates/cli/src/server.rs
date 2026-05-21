@@ -53,6 +53,9 @@ pub async fn run(
     eprintln!("agent-shell daemon listening on {:?}", socket_path);
 
     let pty_notify = Arc::new(Notify::new());
+    // Extract values needed by background tasks before config is moved into AppState.
+    let recording_dir_for_cleanup = config.recording_dir();
+    let retention_days_for_cleanup = config.recording.retention_days;
     let state = Arc::new(Mutex::new(AppState {
         config,
         sessions: HashMap::new(),
@@ -71,6 +74,62 @@ pub async fn run(
             s.clients.retain(|_, c| now.duration_since(c.last_active).as_secs() < 600);
         }
     });
+
+    // Recording retention cleaner: daily scan, delete files older than configured days.
+    {
+        let recording_dir = recording_dir_for_cleanup;
+        let retention_days = retention_days_for_cleanup;
+        if retention_days > 0 {
+            tokio::spawn(async move {
+                // Stagger the first run by 1 minute so daemon startup is not slowed.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let interval_secs = 24 * 3600;
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                loop {
+                    interval.tick().await;
+                    let max_age =
+                        std::time::Duration::from_secs(retention_days * 24 * 3600);
+                    match std::fs::read_dir(&recording_dir) {
+                        Ok(entries) => {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                // Only touch *.jsonl files.
+                                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                                    continue;
+                                }
+                                let age = entry
+                                    .metadata()
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .and_then(|t| t.elapsed().ok());
+                                if let Some(age) = age {
+                                    if age > max_age {
+                                        if let Err(e) = std::fs::remove_file(&path) {
+                                            eprintln!(
+                                                "recording cleanup: failed to remove {:?}: {}",
+                                                path, e
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "recording cleanup: removed {:?} (age {:.1} days)",
+                                                path,
+                                                age.as_secs_f64() / 86400.0
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Directory may not exist yet; not an error.
+                            eprintln!("recording cleanup: cannot read {:?}: {}", recording_dir, e);
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     // Background reaper: periodically drain all PTY masters and reap zombies.
     // After each feed() round we notify waiting attach loops so they can
