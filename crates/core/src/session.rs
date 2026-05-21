@@ -447,6 +447,9 @@ impl Session {
             })
             .map_err(|e| format!("resize failed: {}", e))?;
         self.term.resize(rows, cols);
+        if let Some(ref mut rec) = self.recording {
+            rec.record_resize(rows, cols);
+        }
         self.rows = rows;
         self.cols = cols;
         Ok(())

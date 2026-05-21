@@ -69,6 +69,16 @@ impl Recording {
         self.record("out", bytes);
     }
 
+    /// Record a terminal resize event.
+    ///
+    /// Encodes the new dimensions as `"{rows},{cols}"` in the `data` field
+    /// (base64-encoded, like all other events).  Replay uses `dir == "resize"`
+    /// to detect these and update the TermEmulator grid accordingly.
+    pub fn record_resize(&mut self, rows: u16, cols: u16) {
+        let size_str = format!("{},{}", rows, cols);
+        self.record("resize", size_str.as_bytes());
+    }
+
     fn record(&mut self, dir: &str, bytes: &[u8]) {
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -219,6 +229,54 @@ pub fn filter_query_sequences(buf: &[u8]) -> Vec<u8> {
             // No ST found — malformed DCS. Skip just the two-byte ESC P header
             // and continue scanning so subsequent bytes are not silently dropped.
             i += 2;
+            continue;
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Detect whether a recording's output byte stream uses alternate screen
+/// (i.e. contains `ESC[?1049h`).  Used by `timed_replay` to choose between
+/// the TermEmulator path (alt-screen programs like vim/htop) and the raw-
+/// passthrough path (inline TUI programs like pi that never enter smcup).
+pub fn recording_uses_alt_screen(events: &[RecordingEvent]) -> bool {
+    for ev in events {
+        if ev.dir != "out" { continue; }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&ev.data)
+            .unwrap_or_default();
+        if bytes.windows(8).any(|w| w == b"\x1b[?1049h") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Normalise PTY double-CR line endings produced by inline TUI apps.
+///
+/// When a program running in a PTY writes `\r\n`, the PTY line discipline
+/// (ONLCR) translates the `\n` to `\r\n`, yielding `\r\r\n` in the output
+/// stream that gets recorded.  When this is replayed to a real terminal the
+/// terminal's own ONLCR would turn the final `\n` into `\r\n` again, giving
+/// `\r\r\r\n` — an extra blank column shift on every line.
+///
+/// This function collapses every `\r\r\n` → `\r\n` so the bytes replayed to
+/// the terminal are identical to what the application originally intended.
+pub fn normalize_crlf(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        // Collapse \r\r\n → \r\n
+        if i + 2 < buf.len()
+            && buf[i] == b'\r'
+            && buf[i + 1] == b'\r'
+            && buf[i + 2] == b'\n'
+        {
+            out.push(b'\r');
+            out.push(b'\n');
+            i += 3;
             continue;
         }
         out.push(buf[i]);
@@ -463,28 +521,73 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
 
     // Resolve recording terminal size.
     // Priority: header > heuristic (from output bytes) > fallback 80x24.
+    //
+    // When a header exists but the recording lacks resize events (pre-fix
+    // recordings), the TUI may have rendered at a larger size than the
+    // header claims.  We run the heuristic unconditionally for alt-screen
+    // recordings and take the max of header and heuristic dimensions so
+    // the TermEmulator grid is large enough to contain all addressed cells.
     let is_tty = unsafe { libc::isatty(1) != 0 };
 
+    // Collect all "out" bytes for the heuristic.
+    let all_out: Vec<u8> = events
+        .iter()
+        .filter(|e| e.dir == "out")
+        .flat_map(|e| {
+            base64::engine::general_purpose::STANDARD
+                .decode(&e.data)
+                .unwrap_or_default()
+        })
+        .collect();
+    let heuristic = heuristic_size(&all_out);
+
     let rec_size: (u16, u16) = if let Some(ref h) = header {
-        (h.rows, h.cols)
+        // If the recording has resize events, trust the header as initial
+        // size — the emulator will be resized dynamically.  Otherwise,
+        // take the max of header and heuristic to cover recordings made
+        // before resize events were recorded.
+        let has_resize_events = events.iter().any(|e| e.dir == "resize");
+        if has_resize_events {
+            (h.rows, h.cols)
+        } else if let Some((hr, hc)) = heuristic {
+            (h.rows.max(hr), h.cols.max(hc))
+        } else {
+            (h.rows, h.cols)
+        }
     } else {
-        // Collect all "out" bytes to run the heuristic on.
-        let all_out: Vec<u8> = events
-            .iter()
-            .filter(|e| e.dir == "out")
-            .flat_map(|e| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(&e.data)
-                    .unwrap_or_default()
-            })
-            .collect();
-        heuristic_size(&all_out).unwrap_or((24, 80))
+        heuristic.unwrap_or((24, 80))
     };
 
+    // Detect rendering mode once, before entering the replay loop.
+    //
+    // Alt-screen programs (vim, htop, …) switch to the alternate screen with
+    // `ESC[?1049h` and do absolute cursor addressing within that fixed grid.
+    // For these, feeding bytes into a TermEmulator and calling full_redraw()
+    // per burst produces a correct, flicker-free result.
+    //
+    // Inline TUI programs (pi, lazygit without alt-screen, …) never call
+    // smcup.  They rely on in-place cursor movement (ESC[nA / ESC[2K) and
+    // ONLCR line endings to scroll the terminal naturally.  Running their
+    // output through full_redraw() — which emits ESC[H ESC[2J on every
+    // burst — clears the screen each frame and produces the "scrolling"
+    // artefact the user sees.  For these we pass filtered raw bytes directly
+    // to stdout, which is identical to what `--dump` does but with timing.
+    let uses_alt_screen = recording_uses_alt_screen(&events);
+
     // Create a terminal emulator at the recording's original dimensions.
-    // Output events are fed into this emulator; after each burst we
-    // generate a full_redraw() frame for the client terminal.
+    // Only used when uses_alt_screen is true.
     let mut emu = TermEmulator::new(rec_size.0, rec_size.1);
+
+    // Save the current terminal size so we can restore it when replay ends.
+    // Then resize the terminal to the recording's original dimensions so
+    // full_redraw() frames match the physical screen.
+    let saved_size: Option<(u16, u16)> = if is_tty {
+        let orig = crate::terminal::terminal_size();
+        crate::terminal::set_terminal_size(rec_size.0, rec_size.1);
+        orig
+    } else {
+        None
+    };
 
     // ── Signal handling ────────────────────────────────────────────────────
     // Install a SIGINT handler that sets an atomic flag.  We use
@@ -678,6 +781,35 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
                         .decode(&ev.data)
                         .unwrap_or_default();
                     write_buf.extend_from_slice(&bytes);
+                } else if ev.dir == "resize" {
+                    // Flush any accumulated output before resizing so the
+                    // emulator processes those bytes at the old dimensions.
+                    if uses_alt_screen && !write_buf.is_empty() {
+                        emu.process(&write_buf);
+                        let frame = emu.full_redraw();
+                        out.write_all(&frame)?;
+                        out.flush()?;
+                        write_buf.clear();
+                    }
+                    // Parse "{rows},{cols}" from the resize event data.
+                    if let Ok(size_bytes) = base64::engine::general_purpose::STANDARD
+                        .decode(&ev.data)
+                    {
+                        if let Ok(size_str) = std::str::from_utf8(&size_bytes) {
+                            let parts: Vec<&str> = size_str.split(',').collect();
+                            if parts.len() == 2 {
+                                if let (Ok(r), Ok(c)) = (
+                                    parts[0].parse::<u16>(),
+                                    parts[1].parse::<u16>(),
+                                ) {
+                                    emu.resize(r, c);
+                                    if is_tty {
+                                        crate::terminal::set_terminal_size(r, c);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 group_end_ts = ev.ts;
@@ -695,11 +827,24 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
             }
 
             if !write_buf.is_empty() {
-                // Feed the raw bytes into the terminal emulator, then
-                // generate a full-screen redraw for the client terminal.
-                emu.process(&write_buf);
-                let frame = emu.full_redraw();
-                out.write_all(&frame)?;
+                if uses_alt_screen {
+                    // Alt-screen program: feed into TermEmulator and emit a
+                    // full redraw so the client terminal sees a coherent frame
+                    // regardless of its own scroll position.
+                    emu.process(&write_buf);
+                    let frame = emu.full_redraw();
+                    out.write_all(&frame)?;
+                } else {
+                    // Inline TUI program: pass filtered raw bytes directly.
+                    // filter_query_sequences strips DSR/DCS that would cause
+                    // the terminal to write back to stdin.
+                    // normalize_crlf collapses \r\r\n → \r\n: the recording
+                    // contains the double-CR produced by PTY ONLCR; the replay
+                    // terminal would apply ONLCR again, giving \r\r\r\n.
+                    let filtered = filter_query_sequences(&write_buf);
+                    let normalized = normalize_crlf(&filtered);
+                    out.write_all(&normalized)?;
+                }
                 out.flush()?;
             }
 
@@ -721,11 +866,18 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
     INTERRUPTED_PTR.store(0, Ordering::Release);
     drop(_sigint_guard); // restores previous SIGINT action (SIG_DFL)
 
-    // Cleanup: restore alternate screen.
+    // Cleanup.
     if is_tty {
-        let _ = out.write_all(b"\x1b[?1049l");
+        if uses_alt_screen {
+            // Leave alternate screen and reset attributes.
+            let _ = out.write_all(b"\x1b[?1049l");
+        }
         let _ = out.write_all(b"\x1b[0m");
         let _ = out.flush();
+        // Restore the original terminal size.
+        if let Some((r, c)) = saved_size {
+            crate::terminal::set_terminal_size(r, c);
+        }
         // _raw_guard dropped here → termios restored via RAII.
     }
 
@@ -794,6 +946,76 @@ mod tests {
         let input = b"\x1b[38;5;130mhello\x1b[0m";
         let out = filter_query_sequences(input);
         assert_eq!(out, input);
+    }
+
+    // ─── normalize_crlf ───────────────────────────────────────────
+
+    #[test]
+    fn normalize_collapses_double_cr() {
+        // PTY ONLCR turns \r\n into \r\r\n in the recording.
+        // normalize_crlf must collapse it back to \r\n so the replay
+        // terminal's own ONLCR does not produce a third \r.
+        let input = b"line1\r\r\nline2\r\r\n";
+        let out = normalize_crlf(input);
+        assert_eq!(out, b"line1\r\nline2\r\n");
+    }
+
+    #[test]
+    fn normalize_preserves_single_crlf() {
+        // A plain \r\n (no double CR) must pass through unchanged.
+        let input = b"hello\r\nworld\r\n";
+        let out = normalize_crlf(input);
+        assert_eq!(out, b"hello\r\nworld\r\n");
+    }
+
+    #[test]
+    fn normalize_preserves_standalone_cr() {
+        // A bare \r not followed by another \r\n must pass through.
+        let input = b"\rhello";
+        let out = normalize_crlf(input);
+        assert_eq!(out, b"\rhello");
+    }
+
+    #[test]
+    fn normalize_mixed() {
+        // Mix of \r\r\n and \r\n in the same buffer.
+        let input = b"a\r\r\nb\r\nc\r\r\n";
+        let out = normalize_crlf(input);
+        assert_eq!(out, b"a\r\nb\r\nc\r\n");
+    }
+
+    // ─── recording_uses_alt_screen ───────────────────────────────────
+
+    #[test]
+    fn detects_alt_screen_present() {
+        let ev = RecordingEvent {
+            ts: 0, dir: "out".into(),
+            data: base64::engine::general_purpose::STANDARD
+                .encode(b"\x1b[?1049hsome content"),
+        };
+        assert!(recording_uses_alt_screen(&[ev]));
+    }
+
+    #[test]
+    fn detects_alt_screen_absent() {
+        // Inline TUI (pi-style): no smcup, only cursor-up + erase-line.
+        let ev = RecordingEvent {
+            ts: 0, dir: "out".into(),
+            data: base64::engine::general_purpose::STANDARD
+                .encode(b"\x1b[3A\r\x1b[2Kcontent\r\r\n"),
+        };
+        assert!(!recording_uses_alt_screen(&[ev]));
+    }
+
+    #[test]
+    fn detects_alt_screen_ignores_in_events() {
+        // ESC[?1049h in an "in" (input) event must not count.
+        let ev = RecordingEvent {
+            ts: 0, dir: "in".into(),
+            data: base64::engine::general_purpose::STANDARD
+                .encode(b"\x1b[?1049h"),
+        };
+        assert!(!recording_uses_alt_screen(&[ev]));
     }
 
     // ─── heuristic_size ────────────────────────────────────────────

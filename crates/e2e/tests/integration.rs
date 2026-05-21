@@ -2705,6 +2705,176 @@ mod replay {
             panic!("replay did not exit within 500 ms of receiving 0x04 (Ctrl-D)");
         }
     }
+
+    // -- inline TUI vs alt-screen rendering path ---------------------------
+    //
+    // Bug: timed_replay used TermEmulator + full_redraw() for every burst.
+    // full_redraw() always emits ESC[H ESC[2J (clear screen + cursor home).
+    // For inline TUI programs (pi, etc.) that never enter alternate screen
+    // this clears the terminal each frame -- content appears to scroll
+    // continuously instead of refreshing in place.
+    //
+    // Fix: detect alt-screen use from the recording; inline recordings
+    // bypass TermEmulator and write filtered raw bytes directly, with
+    // \r\r\n (PTY ONLCR artefact) normalised to \r\n.
+
+    // Run timed_replay (not --dump) and return stdout bytes.
+    //
+    // timed_replay is where the inline/alt-screen split lives.
+    // --dump bypasses both normalize_crlf and filter_query_sequences,
+    // so it cannot be used to test those code paths.
+    //
+    // To get timed_replay to exit quickly without relying on a TTY:
+    // - All events share the same timestamp (ts=1001) so inter-event delay = 0.
+    // - stdin is kept open as a Pipe (not closed) so the stdin_watcher does
+    //   not detect an immediate EOF and interrupt the replay before it starts.
+    // - We wait for the process to exit naturally (all events processed).
+    fn run_timed_replay(rec: &std::path::Path) -> Vec<u8> {
+        use std::process::Stdio;
+        use std::io::Read;
+        let cli = find_bin("agent-shell");
+        let mut child = std::process::Command::new(&cli)
+            .args(["replay", rec.to_str().unwrap(), "--speed", "9999"])
+            // Keep stdin pipe write-end open for the entire lifetime of the
+            // child process.  The stdin_watcher thread inside timed_replay
+            // polls fd=0 for readability; if the write-end is closed (EOF)
+            // before all events are processed the watcher sets interrupted=true
+            // and the replay exits with no output.  Keeping the write-end open
+            // means no EOF arrives; the child exits naturally after processing
+            // all zero-delay events and sets replay_done=true, which causes the
+            // watcher to exit cleanly.
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("replay should spawn");
+
+        // Wait for the child to finish (all ts=1001 events are processed
+        // instantly; the child exits before the 10 s deadline).
+        // We intentionally do NOT drop/close child.stdin here.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("timed_replay did not exit within 10 s");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+
+        // Read stdout after the child has exited.
+        let mut out = Vec::new();
+        if let Some(mut stdout) = child.stdout {
+            stdout.read_to_end(&mut out).ok();
+        }
+        // stdin write-end is dropped here (child already exited, safe).
+        out
+    }
+
+    /// Inline TUI replay must NOT emit ESC[H or ESC[2J.
+    ///
+    /// Why this matters: full_redraw() always prepends ESC[H ESC[2J.
+    /// If the inline path accidentally calls full_redraw(), every frame
+    /// clears the terminal and content scrolls rather than refreshing in
+    /// place.  Asserting the absence of these sequences proves the raw
+    /// passthrough path is taken instead of the TermEmulator path.
+    ///
+    /// Recording note: all events share ts=1001 so timed_replay processes
+    /// them instantly (zero inter-event delay) and exits on its own.
+    #[test]
+    fn inline_tui_replay_no_clear_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("inline.jsonl");
+
+        // base64 decodes to:
+        //   ESC[?2026h  ESC[3A
+        //   \r ESC[2K inline_tui_line1 \r\r\n   (x3 lines)
+        //   ESC[?2026l
+        // No ESC[?1049h anywhere -> inline path.
+        let content = concat!(
+            "{\"dir\":\"meta\",\"ts\":1000,\"rows\":24,\"cols\":80,\"program\":\"/bin/bash\"}\n",
+            "{\"ts\":1001,\"dir\":\"out\",\"data\":\"G1s/MjAyNmgbWzNBDRtbMktpbmxpbmVfdHVpX2xpbmUxDQ0KDRtbMktpbmxpbmVfdHVpX2xpbmUyDQ0KDRtbMktpbmxpbmVfdHVpX2xpbmUzDQ0KG1s/MjAyNmw=\"}\n",
+        );
+        std::fs::write(&rec, content).unwrap();
+
+        let bytes = run_timed_replay(&rec);
+
+        assert_contains_text(&bytes, "inline_tui_line1", "inline content present");
+
+        // ESC[H and ESC[2J are only emitted by full_redraw().
+        // Their presence means the TermEmulator path was taken by mistake.
+        assert!(
+            !bytes.windows(3).any(|w| w == b"\x1b[H"),
+            "inline replay must not emit ESC[H (cursor-home from full_redraw): output={:?}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(300)])
+        );
+        assert!(
+            !bytes.windows(4).any(|w| w == b"\x1b[2J"),
+            "inline replay must not emit ESC[2J (clear-screen from full_redraw): output={:?}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(300)])
+        );
+    }
+
+    /// Inline TUI replay must normalise \r\r\n to \r\n.
+    ///
+    /// PTY ONLCR turns every \r\n the program writes into \r\r\n in the
+    /// recording.  The replay terminal would apply ONLCR again, producing
+    /// \r\r\r\n.  normalize_crlf must collapse the extra CR before the bytes
+    /// reach the terminal so the output contains only \r\n line endings.
+    #[test]
+    fn inline_tui_replay_normalises_double_cr() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("crlf.jsonl");
+
+        // "bGluZV9hDQ0KbGluZV9iDQ0K" decodes to b"line_a\r\r\nline_b\r\r\n"
+        let content = concat!(
+            "{\"dir\":\"meta\",\"ts\":1000,\"rows\":24,\"cols\":80,\"program\":\"/bin/bash\"}\n",
+            "{\"ts\":1001,\"dir\":\"out\",\"data\":\"bGluZV9hDQ0KbGluZV9iDQ0K\"}\n",
+        );
+        std::fs::write(&rec, content).unwrap();
+
+        let bytes = run_timed_replay(&rec);
+
+        assert!(
+            !bytes.windows(3).any(|w| w == b"\r\r\n"),
+            "inline replay must not contain \\r\\r\\n after normalisation; got: {:?}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(200)])
+        );
+        assert_contains_text(&bytes, "line_a", "line_a present after normalisation");
+        assert_contains_text(&bytes, "line_b", "line_b present after normalisation");
+    }
+
+    /// Alt-screen replay must use the TermEmulator path (full_redraw).
+    ///
+    /// full_redraw() re-emits ESC[?1049h when the emulator is in alt-screen.
+    /// Its presence in the output proves the TermEmulator path was taken,
+    /// not the raw passthrough path.
+    #[test]
+    fn alt_screen_replay_emits_smcup() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("altscreen.jsonl");
+
+        // "G1s/MTA0OWgbWzE7MUhhbHRfc2NyZWVuX21hcmtlcg==" decodes to:
+        //   ESC[?1049h  ESC[1;1H  alt_screen_marker
+        // No ESC[?1049l — the emulator stays in alt-screen so full_redraw()
+        // emits smcup.  (The previous test data included ESC[?1049l in the
+        // same burst, so the emulator left alt-screen before full_redraw().)
+        let content = concat!(
+            "{\"dir\":\"meta\",\"ts\":1000,\"rows\":24,\"cols\":80,\"program\":\"vim\"}\n",
+            "{\"ts\":1001,\"dir\":\"out\",\"data\":\"G1s/MTA0OWgbWzE7MUhhbHRfc2NyZWVuX21hcmtlcg==\"}\n",
+        );
+        std::fs::write(&rec, content).unwrap();
+
+        let bytes = run_timed_replay(&rec);
+
+        // full_redraw() re-emits smcup when the emulator is in alt-screen.
+        assert_contains_escape(&bytes, b"\x1b[?1049h", "alt-screen replay emits smcup");
+        assert_contains_text(&bytes, "alt_screen_marker", "alt-screen content survives TermEmulator round-trip");
+    }
+
 }
 
 // ═══════════════════════════════════════════════════════════════════
