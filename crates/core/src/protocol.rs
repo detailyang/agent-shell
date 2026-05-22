@@ -182,6 +182,12 @@ pub struct SessionInfo {
     pub created_at: u64,
     pub buffer_size: usize,
     pub recording: bool,
+    /// The program (shell) running in this session, e.g. "/bin/zsh".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// Working directory at session creation time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[cfg(test)]
@@ -273,6 +279,8 @@ mod tests {
             created_at: 1715600000,
             buffer_size: 524288,
             recording: false,
+            program: Some("/bin/zsh".into()),
+            cwd: Some("/home/user".into()),
         };
         let json = serde_json::to_string(&info).unwrap();
         let de: SessionInfo = serde_json::from_str(&json).unwrap();

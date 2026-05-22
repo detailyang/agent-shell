@@ -955,6 +955,8 @@ async fn handle_list(state: Arc<Mutex<AppState>>) -> Response {
             created_at: session.created_at,
             buffer_size: session.buffer_size,
             recording: session.recording.is_some(),
+            program: Some(session.program.clone()),
+            cwd: session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
         })
         .collect();
 

@@ -539,7 +539,12 @@ async fn pick_session(
 /// Format a session label for display.
 fn session_label(s: &agent_shell_core::protocol::SessionInfo) -> String {
     let name = s.name.as_deref().unwrap_or("<unnamed>");
-    format!("{} ({}, pid {})", s.id, name, s.pid)
+    // Show the short program name (basename) instead of the full path.
+    let prog = s.program.as_deref()
+        .map(|p| p.rsplit('/').next().unwrap_or(p))
+        .unwrap_or("?");
+    let cwd = s.cwd.as_deref().unwrap_or("?");
+    format!("{} ({}, {}, {})", s.id, name, prog, cwd)
 }
 
 // ─── Attach: bidirectional raw streaming ─────────────────────────────
@@ -736,6 +741,19 @@ async fn run_attach(socket_path: &PathBuf, req: Request, client_rows: u16, clien
                 }
             }
         }
+    }
+
+    // Reset terminal state before restoring cooked mode.
+    // Without this the outer shell's prompt is visually "stuck" because:
+    //  - The cursor may be mid-screen after the PTY session's last output.
+    //  - SGR attributes (colors, bold) may still be active.
+    //  - The outer shell does not know the screen changed, so it won't
+    //    redraw until the user presses a key.
+    // Writing \r\n ensures the next shell prompt appears on a fresh line.
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(b"\x1b[0m\r\n");
+        let _ = std::io::stdout().flush();
     }
 
     // _raw_guard dropped here → terminal restored

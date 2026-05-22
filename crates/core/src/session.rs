@@ -110,6 +110,7 @@ impl Session {
         if argv.len() > 1 {
             cmd.args(&argv[1..]);
         }
+        let cwd = cwd.or_else(|| std::env::current_dir().ok());
         cmd.cwd(cwd.clone().unwrap_or_else(|| PathBuf::from(".")));
 
         // Set default TERM if not provided by user
