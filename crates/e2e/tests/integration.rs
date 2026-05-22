@@ -2596,12 +2596,11 @@ mod replay {
         }
     }
 
-    /// `replay` must exit when its stdin pipe is closed (EOF = Ctrl-D equivalent).
-    ///
-    /// We pipe an immediately-closed stdin into replay; the stdin-watcher
-    /// thread must detect the EOF and set the interrupted flag.
+    /// When stdin is not a TTY (e.g. /dev/null), replay must NOT exit
+    /// prematurely. It should complete all events and exit normally.
+    /// (SIGINT remains the only way to interrupt non-interactive replay.)
     #[test]
-    fn replay_exits_on_stdin_eof() {
+    fn replay_completes_with_null_stdin() {
         use std::time::{Duration, Instant};
         use std::process::Stdio;
 
@@ -2622,41 +2621,36 @@ mod replay {
 
         let cli_bin = agent_shell_e2e::find_bin("agent-shell");
 
-        // Spawn replay with stdin=null (immediate EOF) at 0.01x speed.
-        let mut child = std::process::Command::new(&cli_bin)
-            .args(&["replay", &recording_path, "--speed", "0.01"])
-            .stdin(Stdio::null())    // ← EOF on first read
-            .stdout(Stdio::null())
+        // Spawn replay with stdin=null at high speed. It should complete
+        // normally (exit 0) rather than being interrupted by stdin EOF.
+        let output = std::process::Command::new(&cli_bin)
+            .args(&["replay", &recording_path, "--speed", "1000"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()
-            .expect("replay should spawn");
+            .output()
+            .expect("replay should complete");
 
-        // Must exit within 500 ms (stdin EOF detected within one poll cycle).
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let exited = loop {
-            match child.try_wait().expect("try_wait") {
-                Some(_) => break true,
-                None if Instant::now() >= deadline => break false,
-                None => std::thread::sleep(Duration::from_millis(20)),
-            }
-        };
-
-        if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("replay did not exit on stdin EOF within 500 ms");
-        }
+        assert!(
+            output.status.success(),
+            "replay with null stdin should exit 0, got: {:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("eof_line1") || stdout.contains("eof_line2"),
+            "replay should produce output even with null stdin. Got: {:?}",
+            &stdout[..stdout.len().min(300)]
+        );
     }
 
-    /// `replay` must exit when 0x04 (Ctrl-D byte) arrives via a pipe.
-    ///
-    /// We send the 0x04 byte after a delay to verify the watcher detects it
-    /// mid-replay, not just at startup.
+    /// When stdin is a pipe and is closed, replay with non-TTY stdin should
+    /// still complete normally (stdin watcher is not started for non-TTY).
+    /// Interruption in non-interactive mode is only via SIGINT.
     #[test]
-    fn replay_exits_on_ctrl_d_byte_in_pipe() {
-        use std::time::{Duration, Instant};
+    fn replay_completes_with_piped_stdin_eof() {
+        use std::time::Duration;
         use std::process::Stdio;
-        use std::io::Write;
 
         let mut daemon = start_daemon();
         let resp = daemon.cli_json(&["create", "--name", "ctrldrec", "--record"]);
@@ -2675,35 +2669,31 @@ mod replay {
 
         let cli_bin = agent_shell_e2e::find_bin("agent-shell");
 
+        // Pipe stdin and close immediately. Replay should still complete
+        // because stdin watcher is not started for non-TTY stdin.
         let mut child = std::process::Command::new(&cli_bin)
-            .args(&["replay", &recording_path, "--speed", "0.01"])
+            .args(&["replay", &recording_path, "--speed", "1000"])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("replay should spawn");
 
-        // Write Ctrl-D after 1 s.
-        let mut stdin = child.stdin.take().unwrap();
-        std::thread::sleep(Duration::from_millis(1000));
-        let _ = stdin.write_all(&[0x04]);
-        drop(stdin);
+        // Drop stdin immediately (close the pipe).
+        drop(child.stdin.take());
 
-        // Must exit within 500 ms of receiving 0x04.
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let exited = loop {
-            match child.try_wait().expect("try_wait") {
-                Some(_) => break true,
-                None if Instant::now() >= deadline => break false,
-                None => std::thread::sleep(Duration::from_millis(20)),
-            }
-        };
-
-        if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("replay did not exit within 500 ms of receiving 0x04 (Ctrl-D)");
-        }
+        let output = child.wait_with_output().expect("wait for replay");
+        assert!(
+            output.status.success(),
+            "replay with closed piped stdin should exit 0, got: {:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("cd_line1") || stdout.contains("cd_line2"),
+            "replay should produce output. Got: {:?}",
+            &stdout[..stdout.len().min(300)]
+        );
     }
 
     // -- inline TUI vs alt-screen rendering path ---------------------------

@@ -648,11 +648,16 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
     // `replay_done` is a second flag the main thread sets when it finishes
     // (naturally or via interruption) so the watcher thread can exit cleanly.
     let replay_done = Arc::new(AtomicBool::new(false));
-    let stdin_watcher = {
+    // Only watch stdin when it is a TTY. When stdin is /dev/null or a pipe
+    // (e.g. replay invoked as a subprocess), read() returns 0 (EOF)
+    // immediately, which would spuriously set `interrupted` and abort the
+    // replay before all events are processed.
+    let stdin_is_tty = unsafe { libc::isatty(0) != 0 };
+    let stdin_watcher = if stdin_is_tty {
         let interrupted = interrupted.clone();
         let replay_done = replay_done.clone();
 
-        std::thread::spawn(move || {
+        Some(std::thread::spawn(move || {
             // Use poll(2) with a short timeout to wait for stdin readability
             // WITHOUT setting O_NONBLOCK on the file description.
             //
@@ -684,7 +689,7 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
                     // poll() itself failed (e.g. EINTR from our SIGINT handler).
                     // EINTR is harmless — just retry.  Any other error is
                     // unexpected; treat as EOF to unblock the main thread.
-                    let err = unsafe { *libc::__error() };
+                    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     if err != libc::EINTR {
                         interrupted.store(true, Ordering::Release);
                         return;
@@ -720,7 +725,9 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
                     return;
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
 
     // Interruptible sleep: break into 10 ms slices so the interrupted flag
@@ -859,7 +866,9 @@ fn timed_replay(reader: BufReader<File>, speed: f64) -> std::io::Result<()> {
     // Must happen before dropping the `interrupted` Arc so the thread's
     // clone of the Arc is the last reference to keep the flag alive.
     replay_done.store(true, Ordering::Release);
-    let _ = stdin_watcher.join();
+    if let Some(watcher) = stdin_watcher {
+        let _ = watcher.join();
+    }
 
     // Deactivate signal handler before dropping the Arc so the pointer
     // stored in INTERRUPTED_PTR is no longer dereferenced.
