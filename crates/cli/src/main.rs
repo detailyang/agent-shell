@@ -729,10 +729,10 @@ async fn run_attach(socket_path: &PathBuf, req: Request, client_rows: u16, clien
                         Ok(0) => running = false, // stdin EOF
                         Ok(n) => {
                             let data = &stdin_buf[..n];
-                            // Ctrl-C (0x03) detaches without forwarding to PTY
-                            if data.contains(&0x03) {
-                                running = false;
-                            } else if stream_tx.write_all(data).await.is_err() {
+                            // Forward all input (including Ctrl-C) to the PTY.
+                            // The shell/readline inside the session handles Ctrl-C
+                            // (clear current line, print ^C). We must not swallow it.
+                            if stream_tx.write_all(data).await.is_err() {
                                 running = false;
                             }
                         }
