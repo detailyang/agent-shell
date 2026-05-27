@@ -341,6 +341,9 @@ fn command_to_request(cmd: Commands) -> Request {
 
             let args: Option<Vec<String>> = shell.map(|s| vec![s]);
 
+            let cwd = cwd.or_else(|| std::env::current_dir().ok()
+                .map(|p| p.to_string_lossy().into_owned()));
+
             Request::Create {
                 name,
                 program: None,
