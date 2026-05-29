@@ -267,10 +267,12 @@ pub fn start_daemon() -> DaemonHandle {
     }
     std::thread::sleep(Duration::from_millis(100));
 
-    let daemon_bin = find_bin("agent-shell-daemon");
     let cli_bin = find_bin("agent-shell");
-
-    let process = Command::new(&daemon_bin)
+    // The daemon is started via `agent-shell daemon` subcommand.
+    // Previously a separate `agent-shell-daemon` binary existed but it has been
+    // merged into the main CLI binary.
+    let process = Command::new(&cli_bin)
+        .arg("daemon")
         .env("AGENT_SHELL_HOME", &base_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())  // Capture stderr for debugging

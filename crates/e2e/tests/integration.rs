@@ -519,8 +519,9 @@ mod sigterm {
         std::fs::create_dir_all(&base).ok();
 
         // Start daemon in its own process group so cargo test doesn't interfere
-        let daemon_bin = agent_shell_e2e::find_bin("agent-shell-daemon");
-        let mut daemon = std::process::Command::new(&daemon_bin)
+        let cli_bin = agent_shell_e2e::find_bin("agent-shell");
+        let mut daemon = std::process::Command::new(&cli_bin)
+            .arg("daemon")
             .env("AGENT_SHELL_HOME", &base)
             .process_group(0)
             .stderr(std::process::Stdio::piped())
@@ -5873,6 +5874,695 @@ mod audit_regression {
             assert_eq!(header.dir, "meta", "header dir must be 'meta'");
         }
 
+        daemon.stop();
+    }
+}
+
+// ─── Interactive subprocess tests ─────────────────────────────────────────────
+// These tests validate the output-stabilization fallback that allows `send` to
+// complete inside interactive subprocesses (SSH-like, python, bc, etc.) where
+// fg_pgid never returns to the shell.
+
+mod interactive_subprocess {
+    use super::*;
+    use std::time::Duration;
+
+    // ── Helper: create a session running bash as a nested subprocess ──
+    // This simulates the SSH scenario: the outer shell spawns a child (bash),
+    // and from send's perspective fg_pgid stays on that child.
+    fn create_nested_bash(daemon: &DaemonHandle) -> String {
+        let resp = daemon.cli_json(&["create", "--name", "nested"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+        // Start a nested bash (simulates SSH: fg_pgid = nested bash, never returns)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "bash --norc --noprofile",
+        ]);
+        assert_ok(&resp);
+        sid
+    }
+
+    /// Basic: execute a command inside a nested interactive subprocess.
+    /// The stabilization fallback (500ms idle) should allow completion.
+    #[test]
+    fn nested_bash_echo() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo from_nested",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("from_nested"),
+            "expected 'from_nested' in output, got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Multiple sequential commands in a nested subprocess.
+    #[test]
+    fn nested_bash_sequential_commands() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo cmd1_output",
+        ]);
+        assert_ok(&resp);
+        assert!(resp.output.unwrap_or_default().contains("cmd1_output"));
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo cmd2_output",
+        ]);
+        assert_ok(&resp);
+        assert!(resp.output.unwrap_or_default().contains("cmd2_output"));
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo cmd3_output",
+        ]);
+        assert_ok(&resp);
+        assert!(resp.output.unwrap_or_default().contains("cmd3_output"));
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Interactive confirmation: send "y" to a prompt.
+    /// Simulates `rm -i` or any program asking yes/no.
+    #[test]
+    fn interactive_yes_confirmation() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Create a temp file and use a script that asks for confirmation
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "TMPF=$(mktemp) && echo testdata > $TMPF && echo $TMPF",
+        ]);
+        assert_ok(&resp);
+
+        // Use bash read to simulate an interactive prompt
+        // Script: ask "Delete? [y/n]", read answer, if y then remove and print done
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait",
+            r#"bash -c 'read -p "Delete? [y/n] " ans; if [ "$ans" = "y" ]; then echo DELETED; else echo KEPT; fi'"#,
+        ]);
+        assert_ok(&resp);
+
+        // Wait for the prompt to appear
+        let resp = daemon.cli_json(&[
+            "wait", "--session", &sid, "--timeout", "5000",
+            r"Delete\?",
+        ]);
+        assert_ok(&resp);
+
+        // Send "y" to confirm
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000", "y",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("DELETED"),
+            "expected 'DELETED' after sending y, got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Interactive: send "n" to reject a prompt.
+    #[test]
+    fn interactive_no_confirmation() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait",
+            r#"bash -c 'read -p "Continue? [y/n] " ans; if [ "$ans" = "y" ]; then echo YES; else echo NO; fi'"#,
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&[
+            "wait", "--session", &sid, "--timeout", "5000",
+            r"Continue\?",
+        ]);
+        assert_ok(&resp);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000", "n",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("NO"),
+            "expected 'NO' after sending n, got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Python REPL: multiple expressions without prompt regex.
+    /// Uses output stabilization to detect completion.
+    #[test]
+    fn python_no_prompt_stabilization() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Start python3 (fg_pgid won't return to shell)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "10000",
+            "python3 -u",
+        ]);
+        assert_ok(&resp);
+
+        // Send expression — should complete via stabilization
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "print(42 * 2)",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("84"),
+            "expected '84' in python output, got: {:?}", output
+        );
+
+        // Another expression
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "print('hello_from_python')",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("hello_from_python"),
+            "expected 'hello_from_python', got: {:?}", output
+        );
+
+        // Exit python
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--nowait", "exit()"]);
+        std::thread::sleep(Duration::from_millis(500));
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Custom idle-timeout parameter: shorter idle for fast responses.
+    #[test]
+    fn custom_idle_timeout() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        // Use a short idle-timeout for a fast command
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "--idle-timeout", "200",
+            "echo fast_response",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("fast_response"),
+            "expected 'fast_response', got: {:?}", output
+        );
+        // Elapsed should be roughly 200ms + poll overhead, not 500ms
+        let elapsed = resp.elapsed_ms.unwrap_or(9999);
+        assert!(
+            elapsed < 1000,
+            "expected elapsed < 1000ms with idle-timeout=200, got: {}ms", elapsed
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// bc calculator: interactive math in a subprocess.
+    #[test]
+    fn bc_calculator() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Start bc (interactive calculator, fg stays on bc)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "bc -q",
+        ]);
+        assert_ok(&resp);
+
+        // Send math expression
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "2 + 3",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("5"),
+            "expected '5' from bc, got: {:?}", output
+        );
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "10 * 20",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("200"),
+            "expected '200' from bc, got: {:?}", output
+        );
+
+        // Quit bc
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--nowait", "quit"]);
+        std::thread::sleep(Duration::from_millis(500));
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Nested shell with prompt regex: most reliable completion detection.
+    #[test]
+    fn nested_bash_with_prompt_regex() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Start nested bash with known prompt
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "bash --norc --noprofile",
+        ]);
+        assert_ok(&resp);
+
+        // Set a custom PS1 in the nested bash
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "export PS1='TEST> '",
+        ]);
+        assert_ok(&resp);
+
+        // Now set prompt regex to detect the nested shell's prompt
+        let resp = daemon.cli_json(&[
+            "set-prompt", "--session", &sid, "TEST> ",
+        ]);
+        assert_ok(&resp);
+
+        // Commands should now complete via prompt detection (faster than stabilization)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo prompt_based",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("prompt_based"),
+            "expected 'prompt_based', got: {:?}", output
+        );
+        // Should be faster than 500ms since prompt detection is immediate
+        let elapsed = resp.elapsed_ms.unwrap_or(9999);
+        assert!(
+            elapsed < 500,
+            "prompt-based detection should be < 500ms, got: {}ms", elapsed
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Multi-step interactive workflow: script prompts multiple times.
+    #[test]
+    fn multi_step_interactive_prompts() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Create a script that asks multiple questions
+        let script = r#"bash -c '
+read -p "Name: " name
+read -p "Age: " age
+echo "Hello $name, you are $age years old"
+'"#;
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait", script,
+        ]);
+        assert_ok(&resp);
+
+        // Wait for first prompt
+        let resp = daemon.cli_json(&[
+            "wait", "--session", &sid, "--timeout", "5000",
+            "Name:",
+        ]);
+        assert_ok(&resp);
+
+        // Answer first prompt
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000", "Alice",
+        ]);
+        assert_ok(&resp);
+
+        // Wait for second prompt
+        let resp = daemon.cli_json(&[
+            "wait", "--session", &sid, "--timeout", "5000",
+            "Age:",
+        ]);
+        assert_ok(&resp);
+
+        // Answer second prompt
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000", "30",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("Hello Alice") && output.contains("30 years old"),
+            "expected greeting with name and age, got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// cat subprocess: send input and get echo back.
+    /// Tests that single-character / short responses also stabilize.
+    #[test]
+    fn cat_echo_interactive() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Start cat (reads stdin, echoes to stdout)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait", "cat",
+        ]);
+        assert_ok(&resp);
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Send a line — cat echoes it back
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "hello_cat",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("hello_cat"),
+            "expected 'hello_cat' from cat, got: {:?}", output
+        );
+
+        // Send another line
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "world_cat",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("world_cat"),
+            "expected 'world_cat' from cat, got: {:?}", output
+        );
+
+        // Ctrl-C to exit cat
+        let _ = daemon.cli_json(&["send", "--session", &sid, "--ctrl", "c"]);
+        std::thread::sleep(Duration::from_millis(300));
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Nowait + wait pattern: the classic SSH workflow.
+    /// Send command with nowait, then wait for specific output.
+    #[test]
+    fn nowait_then_wait_workflow() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        // Send with nowait. Use a variable assignment so the "end" marker
+        // only appears in actual output, not in the command echo line.
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait",
+            "echo start_mark && sleep 0.2 && V=done_mark && echo $V",
+        ]);
+        assert_ok(&resp);
+
+        // Wait for the end marker (output of $V)
+        let resp = daemon.cli_json(&[
+            "wait", "--session", &sid, "--timeout", "5000",
+            "done_mark",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("start_mark") && output.contains("done_mark"),
+            "expected both markers, got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Password-like prompt: send sensitive input after detecting prompt.
+    #[test]
+    fn password_prompt_workflow() {
+        let mut daemon = start_daemon();
+        let resp = daemon.cli_json(&["create"]);
+        assert_ok(&resp);
+        let sid = session_id(&resp);
+
+        // Script that simulates a password prompt (no echo)
+        let script = r#"bash -c 'read -sp "Password: " pass; echo; echo "Got: $pass"'"#;
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait", script,
+        ]);
+        assert_ok(&resp);
+
+        // Wait for the password prompt
+        let resp = daemon.cli_json(&[
+            "wait", "--session", &sid, "--timeout", "5000",
+            "Password:",
+        ]);
+        assert_ok(&resp);
+
+        // Send password (won't be echoed, but the program continues)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "secret123",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("Got: secret123"),
+            "expected 'Got: secret123', got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Nested bash exit: subprocess exits and fg returns to shell.
+    /// After the nested bash exits, normal fg_pgid detection should resume.
+    #[test]
+    fn nested_bash_exit_returns_to_shell() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        // Execute in nested bash
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo in_nested",
+        ]);
+        assert_ok(&resp);
+        assert!(resp.output.unwrap_or_default().contains("in_nested"));
+
+        // Exit the nested bash
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000", "exit",
+        ]);
+        assert_ok(&resp);
+
+        // Now we're back in the original shell — fg_pgid should work again
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo back_in_shell",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("back_in_shell"),
+            "expected 'back_in_shell' after exiting nested bash, got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Idle timeout with slow output: command producing output in bursts.
+    /// The default 500ms idle should not prematurely cut off output.
+    #[test]
+    fn slow_output_not_premature_cutoff() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        // Command that outputs with small gaps (< 500ms)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "10000",
+            "for i in 1 2 3; do echo line_$i; sleep 0.2; done",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        // All three lines should be captured because gaps (200ms) < idle threshold (500ms)
+        assert!(
+            output.contains("line_1") && output.contains("line_2") && output.contains("line_3"),
+            "expected all three lines, got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Two-level nesting: shell → bash → bash.
+    /// Validates stabilization works at arbitrary nesting depth.
+    #[test]
+    fn double_nested_bash() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        // Start another nested bash (2 levels deep)
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "bash --norc --noprofile",
+        ]);
+        assert_ok(&resp);
+
+        // Execute in doubly-nested bash
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo double_nested_ok",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("double_nested_ok"),
+            "expected 'double_nested_ok', got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Interactive program with multi-line output.
+    /// Ensures stabilization waits for all output, not just first line.
+    #[test]
+    fn multiline_output_in_subprocess() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo line_a && echo line_b && echo line_c",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("line_a") && output.contains("line_b") && output.contains("line_c"),
+            "expected all lines, got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Send empty string to subprocess (should be no-op).
+    #[test]
+    fn send_empty_to_subprocess() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "2000", "",
+        ]);
+        assert_ok(&resp);
+        // Empty send returns immediately
+        let elapsed = resp.elapsed_ms.unwrap_or(9999);
+        assert!(elapsed < 100, "empty send should be instant, got: {}ms", elapsed);
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Ctrl-C in a subprocess should still work.
+    #[test]
+    fn ctrl_c_in_subprocess() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        // Start a long-running command in the nested bash
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--nowait", "sleep 60",
+        ]);
+        assert_ok(&resp);
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Ctrl-C to interrupt
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--ctrl", "c",
+        ]);
+        assert_ok(&resp);
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Should be able to run commands again
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "echo after_interrupt",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("after_interrupt"),
+            "expected 'after_interrupt', got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
+        daemon.stop();
+    }
+
+    /// Command with exit code in subprocess.
+    #[test]
+    fn exit_code_in_subprocess() {
+        let mut daemon = start_daemon();
+        let sid = create_nested_bash(&daemon);
+
+        let resp = daemon.cli_json(&[
+            "send", "--session", &sid, "--timeout", "5000",
+            "false; echo exit_code_$?",
+        ]);
+        assert_ok(&resp);
+        let output = resp.output.unwrap_or_default();
+        assert!(
+            output.contains("exit_code_1"),
+            "expected 'exit_code_1', got: {:?}", output
+        );
+
+        daemon.cli_json(&["destroy", "--session", &sid]);
         daemon.stop();
     }
 }

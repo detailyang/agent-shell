@@ -35,6 +35,11 @@ pub enum Request {
         ctrl: Option<String>,      // "c", "d", "z"
         nowait: Option<bool>,
         timeout_ms: Option<u64>,
+        /// Output idle timeout in milliseconds. When no new output arrives for
+        /// this duration, the command is considered complete. Used as the
+        /// stabilization threshold regardless of fg_pgid state.
+        /// Default: 150ms when fg_at_shell, 500ms when in a subprocess.
+        idle_timeout_ms: Option<u64>,
         client_id: Option<String>,
     },
 

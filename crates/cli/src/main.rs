@@ -83,6 +83,11 @@ enum Commands {
         nowait: bool,
         #[arg(long)]
         timeout: Option<u64>,
+        /// Output idle timeout (ms). Command is considered done when no new
+        /// output arrives for this duration. Default: 150ms at shell, 500ms
+        /// in a subprocess (e.g. SSH, python, gdb).
+        #[arg(long = "idle-timeout")]
+        idle_timeout: Option<u64>,
         #[arg(long = "client-id")]
         client_id: Option<String>,
     },
@@ -362,12 +367,13 @@ fn command_to_request(cmd: Commands) -> Request {
             // before command_to_request is called.
             session_id: session.unwrap_or_default(),
         },
-        Commands::Send { session, text, ctrl, nowait, timeout, client_id } => Request::Send {
+        Commands::Send { session, text, ctrl, nowait, timeout, idle_timeout, client_id } => Request::Send {
             session_id: session,
             text: text.unwrap_or_default(),
             ctrl,
             nowait: if nowait { Some(true) } else { None },
             timeout_ms: timeout,
+            idle_timeout_ms: idle_timeout,
             client_id,
         },
         Commands::Read { session, screen, client_id } => Request::Read {
