@@ -466,10 +466,8 @@ async fn fetch_sessions(socket_path: &PathBuf) -> Result<Vec<agent_shell_core::p
         }
     };
 
-    let data = serde_json::to_vec(&req).map_err(|e| format!("serialize: {}", e))?;
-    let len = data.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await.map_err(|e| format!("write: {}", e))?;
-    stream.write_all(&data).await.map_err(|e| format!("write: {}", e))?;
+    let frame = agent_shell_core::attach::request_frame(&req)?;
+    stream.write_all(&frame).await.map_err(|e| format!("write: {}", e))?;
 
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.map_err(|e| format!("read: {}", e))?;
@@ -558,24 +556,6 @@ fn session_label(s: &agent_shell_core::protocol::SessionInfo) -> String {
 
 // ─── Attach: bidirectional raw streaming ─────────────────────────────
 
-/// Remove DSR (Device Status Report, ESC[6n) sequences from a byte stream.
-/// These cause the client terminal to emit CPR responses that, in writable
-/// attach mode, get forwarded to the PTY and misinterpreted as keystrokes.
-fn strip_dsr(data: &[u8]) -> Vec<u8> {
-    const DSR: &[u8] = b"\x1b[6n";
-    let mut out = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i < data.len() {
-        if i + DSR.len() <= data.len() && &data[i..i + DSR.len()] == DSR {
-            i += DSR.len();
-        } else {
-            out.push(data[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
 /// Resize session via a separate connection (before attach enters binary mode).
 async fn resize_via_separate_connection(socket_path: &PathBuf, session_id: &str, rows: u16, cols: u16) -> Result<(), String> {
     let mut stream = tokio::net::UnixStream::connect(socket_path)
@@ -645,12 +625,12 @@ async fn run_attach(socket_path: &PathBuf, req: Request, client_rows: u16, clien
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.map_err(|e| format!("read handshake: {}", e))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
+    if len > agent_shell_core::attach::MAX_HANDSHAKE_RESPONSE_BYTES {
         return Err("handshake response too large".into());
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await.map_err(|e| format!("read handshake: {}", e))?;
-    let resp: Response = serde_json::from_slice(&buf).map_err(|e| format!("parse handshake: {}", e))?;
+    let resp = agent_shell_core::attach::decode_response(&buf)?;
 
     if !resp.ok {
         // Print error as JSON and exit
@@ -662,22 +642,10 @@ async fn run_attach(socket_path: &PathBuf, req: Request, client_rows: u16, clien
     // Enter raw mode BEFORE writing the initial snapshot.
     let _raw_guard = enter_raw_mode();
 
-    if let Some(output) = &resp.output {
-        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, output) {
-            Ok(bytes) => {
-                // Strip DSR (Device Status Report = ESC[6n) as a safety measure.
-                // The server now sends a full_redraw snapshot from the terminal
-                // emulator, which should not contain DSR. But strip anyway in
-                // case of edge cases.
-                let filtered = strip_dsr(&bytes);
-                let _ = std::io::stdout().write_all(&filtered);
-                let _ = std::io::stdout().flush();
-            }
-            Err(_) => {
-                let _ = std::io::stdout().write_all(output.as_bytes());
-                let _ = std::io::stdout().flush();
-            }
-        }
+    if resp.output.is_some() {
+        let output = agent_shell_core::attach::initial_output(&resp);
+        let _ = std::io::stdout().write_all(&output);
+        let _ = std::io::stdout().flush();
     }
 
     let (mut stream_rx, mut stream_tx) = stream.into_split();

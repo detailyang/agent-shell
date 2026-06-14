@@ -2602,7 +2602,7 @@ mod replay {
     /// (SIGINT remains the only way to interrupt non-interactive replay.)
     #[test]
     fn replay_completes_with_null_stdin() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         use std::process::Stdio;
 
         let mut daemon = start_daemon();
@@ -4043,7 +4043,7 @@ mod attach_render {
         assert_ok(&resp);
 
         // Now attach — initial_output should have the colors
-        let mut conn = daemon.connect_attach_rw(&sid).expect("attach");
+        let conn = daemon.connect_attach_rw(&sid).expect("attach");
         let bytes = &conn.initial_output;
 
         assert_contains_escape(bytes, b"\x1b[31m", "attach handshake red fg");
@@ -4069,7 +4069,7 @@ mod attach_render {
         ]);
         assert_ok(&resp);
 
-        let mut conn = daemon.connect_attach_rw(&sid).expect("attach");
+        let conn = daemon.connect_attach_rw(&sid).expect("attach");
         let bytes = &conn.initial_output;
 
         assert_contains_escape(bytes, b"\x1b[2;1H", "attach handshake cursor pos");
@@ -4092,7 +4092,7 @@ mod attach_render {
         let sid = session_id(&resp);
 
         // Generate colored output larger than 4KB buffer
-        let resp = daemon.cli_json(&[
+        let _resp = daemon.cli_json(&[
             "send", "--session", &sid, "--timeout", "10000",
             "for i in $(seq 1 100); do printf '\\033[31mLINE_%04d\\033[0m\n' $i; done",
         ]);
@@ -4289,7 +4289,7 @@ mod read_render {
         let sid = session_id(&resp);
 
         // Generate colored output exceeding buffer
-        let resp = daemon.cli_json(&[
+        let _resp = daemon.cli_json(&[
             "send", "--session", &sid, "--timeout", "10000",
             "for i in $(seq 1 100); do printf '\\033[36mLINE_%04d\\033[0m\n' $i; done",
         ]);
@@ -5378,7 +5378,7 @@ mod vim {
 
     /// `G` goes to the last line; `gg` goes to the first line.
     #[test]
-    fn vim_G_and_gg() {
+    fn vim_g_and_gg() {
         let mut daemon = start_daemon();
         let (file, lines) = make_test_file(&["a", "b", "c", "d", "e"]);
         let path = file.path().to_str().unwrap().to_string();

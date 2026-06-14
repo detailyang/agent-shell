@@ -17,6 +17,29 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 30000;
 /// Minimum buffer size.
 pub const MIN_BUFFER_SIZE: usize = 4096;
 
+pub struct SendReadiness {
+    pub ready: bool,
+    pub exit_code: Option<i32>,
+    pub overflowed: bool,
+    pub lost_bytes: u64,
+}
+
+pub struct SendReadinessTracker {
+    write_cursor_before: u64,
+    stable_since: Option<Instant>,
+    last_write_cursor: u64,
+}
+
+impl SendReadinessTracker {
+    pub fn new(write_cursor_before: u64) -> Self {
+        Self {
+            write_cursor_before,
+            stable_since: None,
+            last_write_cursor: write_cursor_before,
+        }
+    }
+}
+
 pub struct Session {
     pub id: String,
     pub name: Option<String>,
@@ -32,8 +55,8 @@ pub struct Session {
     pub exited: Option<i32>,
     /// True once destroy has started — other operations should reject.
     pub destroying: bool,
-    pub created_at: u64,  // Unix timestamp in seconds
-    pub created_at_instant: Instant,  // For elapsed time calculations
+    pub created_at: u64,             // Unix timestamp in seconds
+    pub created_at_instant: Instant, // For elapsed time calculations
     pub cwd: Option<PathBuf>,
     /// Environment variables passed to the child at spawn time.
     /// Stored here for inspection / debugging only; the child already has them.
@@ -87,9 +110,9 @@ impl Session {
             .max(MIN_BUFFER_SIZE);
 
         let prompt_regex = match prompt {
-            Some(ref p) if !p.is_empty() => Some(
-                Regex::new(p).map_err(|e| format!("invalid regex: {}", e))?,
-            ),
+            Some(ref p) if !p.is_empty() => {
+                Some(Regex::new(p).map_err(|e| format!("invalid regex: {}", e))?)
+            }
             _ => None,
         };
 
@@ -259,9 +282,7 @@ impl Session {
         writer
             .write_all(data.as_bytes())
             .map_err(|e| format!("write failed: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("flush failed: {}", e))?;
+        writer.flush().map_err(|e| format!("flush failed: {}", e))?;
         drop(writer);
         if let Some(ref mut rec) = self.recording {
             rec.record_in(data.as_bytes());
@@ -275,9 +296,7 @@ impl Session {
         writer
             .write_all(data)
             .map_err(|e| format!("write failed: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("flush failed: {}", e))?;
+        writer.flush().map_err(|e| format!("flush failed: {}", e))?;
         drop(writer);
         if let Some(ref mut rec) = self.recording {
             rec.record_in(data);
@@ -298,9 +317,7 @@ impl Session {
         writer
             .write_all(&[byte])
             .map_err(|e| format!("write failed: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("flush failed: {}", e))?;
+        writer.flush().map_err(|e| format!("flush failed: {}", e))?;
         drop(writer);
         if let Some(ref mut rec) = self.recording {
             rec.record_in(&[byte]);
@@ -359,6 +376,67 @@ impl Session {
         self.send_seq
     }
 
+    pub fn begin_send_readiness(&mut self, write_cursor_before: u64) -> SendReadinessTracker {
+        let _ = self.ringbuf.take_overflow();
+        SendReadinessTracker::new(write_cursor_before)
+    }
+
+    pub fn check_send_readiness(
+        &mut self,
+        tracker: &mut SendReadinessTracker,
+        idle_timeout_ms: Option<u64>,
+    ) -> SendReadiness {
+        self.feed();
+        let wc = self.ringbuf.write_cursor();
+
+        self.check_fg_pgid();
+        let fg_at_shell = self.current_fg_pgid == self.shell_pgid;
+        let exit_code = self.check_exited();
+
+        let prompt_matched = if let Some(ref regex) = self.prompt_regex {
+            if wc > tracker.write_cursor_before {
+                let (new_data, _, _) = self.ringbuf.read(tracker.write_cursor_before);
+                let text = String::from_utf8_lossy(&new_data);
+                regex.is_match(&text)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let (overflowed, lost_bytes) = self.ringbuf.take_overflow();
+        if overflowed {
+            return SendReadiness {
+                ready: false,
+                exit_code,
+                overflowed,
+                lost_bytes,
+            };
+        }
+
+        if wc != tracker.last_write_cursor {
+            tracker.stable_since = None;
+            tracker.last_write_cursor = wc;
+        } else {
+            tracker.stable_since.get_or_insert(Instant::now());
+        }
+
+        let idle_threshold_ms = idle_timeout_ms.unwrap_or(if fg_at_shell { 150 } else { 500 });
+        let has_new_output = wc > tracker.write_cursor_before;
+        let output_stable = tracker
+            .stable_since
+            .map(|t| t.elapsed().as_millis() >= idle_threshold_ms as u128)
+            .unwrap_or(false);
+
+        SendReadiness {
+            ready: prompt_matched || exit_code.is_some() || (has_new_output && output_stable),
+            exit_code,
+            overflowed: false,
+            lost_bytes: 0,
+        }
+    }
+
     /// Check if fg_pgid has returned to the shell pgid (from a different value).
     pub fn fg_returned_to_shell(&self) -> bool {
         self.current_fg_pgid == self.shell_pgid && self.prev_fg_pgid != self.shell_pgid
@@ -371,10 +449,7 @@ impl Session {
         // Send SIGHUP to the process group (negative pgid = kill whole group)
         // Guard against pgid <= 0: kill(0) signals all processes in the caller's group.
         if self.shell_pgid > 0 {
-            let _ = signal::kill(
-                nix::unistd::Pid::from_raw(-self.shell_pgid),
-                Signal::SIGHUP,
-            );
+            let _ = signal::kill(nix::unistd::Pid::from_raw(-self.shell_pgid), Signal::SIGHUP);
         }
         // Also send to child directly as fallback
         let _ = signal::kill(
@@ -422,15 +497,9 @@ impl Session {
                 if let Ok(child_pid) = line.trim().parse::<i32>() {
                     if child_pid > 0 {
                         // Kill the child's process group
-                        let _ = signal::kill(
-                            nix::unistd::Pid::from_raw(-child_pid),
-                            sig,
-                        );
+                        let _ = signal::kill(nix::unistd::Pid::from_raw(-child_pid), sig);
                         // Also kill the child directly
-                        let _ = signal::kill(
-                            nix::unistd::Pid::from_raw(child_pid),
-                            sig,
-                        );
+                        let _ = signal::kill(nix::unistd::Pid::from_raw(child_pid), sig);
                     }
                 }
             }

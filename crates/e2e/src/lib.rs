@@ -109,30 +109,25 @@ impl AttachConnection {
             session_id: session_id.to_string(),
             writable: if writable { Some(true) } else { None },
         };
-        let data = serde_json::to_vec(&req).map_err(|e| format!("serialize: {}", e))?;
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).map_err(|e| format!("write: {}", e))?;
-        stream.write_all(&data).map_err(|e| format!("write: {}", e))?;
+        let frame = agent_shell_core::attach::request_frame(&req)?;
+        stream.write_all(&frame).map_err(|e| format!("write: {}", e))?;
 
         // Read initial JSON response
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).map_err(|e| format!("read len: {}", e))?;
         let resp_len = u32::from_be_bytes(len_buf) as usize;
+        if resp_len > agent_shell_core::attach::MAX_HANDSHAKE_RESPONSE_BYTES {
+            return Err("handshake response too large".into());
+        }
         let mut buf = vec![0u8; resp_len];
         stream.read_exact(&mut buf).map_err(|e| format!("read resp: {}", e))?;
-        let resp: Response = serde_json::from_slice(&buf).map_err(|e| format!("parse: {}", e))?;
+        let resp = agent_shell_core::attach::decode_response(&buf)?;
 
         if !resp.ok {
             return Err(resp.error.unwrap_or_else(|| "attach failed".into()));
         }
 
-        // Decode the base64-encoded initial output
-        let initial_output = resp.output
-            .as_ref()
-            .and_then(|s| base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD, s
-            ).ok())
-            .unwrap_or_default();
+        let initial_output = agent_shell_core::attach::initial_output(&resp);
 
         Ok(AttachConnection { stream, initial_output })
     }

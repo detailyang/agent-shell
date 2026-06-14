@@ -545,31 +545,16 @@ async fn handle_send(
         return resp;
     }
 
-    // Step 3: Wait for readiness signal
-    // Strategy: poll until one of these fires (first wins):
-    //   a. prompt_regex matches new output → interactive program ready
-    //   b. child process exited → done
-    //   c. output stabilized (no new bytes for idle_threshold) → command done
-    //
-    // idle_threshold adapts: 150ms when fg is at shell (fast, deterministic),
-    // 500ms inside a subprocess like SSH/python/gdb (tolerates network jitter).
-    // User can override with --idle-timeout.
-    //
-    // fg_at_shell (tcgetpgrp == shell_pgid) is used only to choose the default
-    // idle threshold — it does NOT gate any completion condition.
-    //
-    // Track overflow per-send. take_overflow() resets the flag,
-    // so any overflow detected in the loop must have happened during this send.
-    {
+    let mut readiness = {
         let mut s = state.lock().await;
-        if let Some(session) = s.sessions.get_mut(&session_id) {
-            let _ = session.ringbuf.take_overflow(); // clear any pre-existing overflow
-        }
-    }
+        let session = match s.sessions.get_mut(&session_id) {
+            Some(s) => s,
+            None => return Response::err("session not found"),
+        };
+        session.begin_send_readiness(write_cursor_before)
+    };
 
     let deadline = start + std::time::Duration::from_millis(timeout_ms);
-    let mut stable_since: Option<std::time::Instant> = None;
-    let mut last_wc = write_cursor_before;
 
     loop {
         if std::time::Instant::now() >= deadline {
@@ -597,90 +582,27 @@ async fn handle_send(
             return resp;
         }
 
-        // Check readiness
-        let (fg_at_shell, prompt_matched, exit_code, wc, overflowed, lost) = {
+        let check = {
             let mut s = state.lock().await;
             let session = match s.sessions.get_mut(&session_id) {
                 Some(s) => s,
                 None => return Response::err("session not found"),
             };
-
-            session.feed();
-            let wc = session.ringbuf.write_cursor();
-
-            session.check_fg_pgid();
-            let fg_at_shell = session.current_fg_pgid == session.shell_pgid;
-
-            let exit_code = session.check_exited();
-
-            // Check prompt regex match in all output since this send started.
-            // We read from write_cursor_before (not prompt_check_cursor) to
-            // ensure prompts that arrive split across multiple PTY reads are
-            // still matched correctly. The allocation is bounded by buffer size
-            // and only occurs when a prompt regex is configured.
-            let prompt_matched = if let Some(ref regex) = session.prompt_regex {
-                if wc > write_cursor_before {
-                    let (new_data, _, _) = session.ringbuf.read(write_cursor_before);
-                    let text = String::from_utf8_lossy(&new_data);
-                    regex.is_match(&text)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            let (overflowed, lost) = session.ringbuf.take_overflow();
-
-            (fg_at_shell, prompt_matched, exit_code, wc, overflowed, lost)
+            session.check_send_readiness(&mut readiness, idle_timeout_ms)
         };
 
-        if overflowed {
+        if check.overflowed {
             return Response {
                 ok: false,
                 seq: Some(seq),
                 error: Some("buffer_overflow".into()),
-                lost_bytes: Some(lost),
+                lost_bytes: Some(check.lost_bytes),
                 elapsed_ms: Some(start.elapsed().as_millis() as u64),
                 ..Response::ok()
             };
         }
 
-        // Track output stabilization.
-        // When fg is at shell, we use a short idle threshold (150ms default).
-        // When fg is NOT at shell (e.g. inside SSH, python, gdb), we also
-        // track stabilization but use a longer threshold (500ms default)
-        // to tolerate network latency and bursty output.
-        if wc != last_wc {
-            stable_since = None;
-            last_wc = wc;
-        } else {
-            // Start stabilization timer regardless of fg_at_shell.
-            // Previously this was gated on fg_at_shell, which meant commands
-            // inside interactive subprocesses (SSH, python, gdb) could never
-            // trigger stabilization-based completion.
-            stable_since.get_or_insert(std::time::Instant::now());
-        }
-
-        // Choose idle threshold based on whether fg is at shell.
-        // In-shell commands complete quickly and predictably (150ms);
-        // subprocess commands may have network delays (500ms).
-        // User can override via --idle-timeout.
-        let idle_threshold_ms = idle_timeout_ms.unwrap_or(
-            if fg_at_shell { 150 } else { 500 }
-        );
-
-        // Ready conditions (unified — no fg_at_shell gating):
-        // 1. Prompt matched → interactive program ready
-        // 2. Process exited → done
-        // 3. Output has stabilized (no new output for idle_threshold) → command done
-        let has_new_output = wc > write_cursor_before;
-        let output_stable = stable_since
-            .map(|t| t.elapsed().as_millis() >= idle_threshold_ms as u128)
-            .unwrap_or(false);
-
-        if prompt_matched || exit_code.is_some() || (has_new_output && output_stable)
-        {
+        if check.ready {
             let mut s = state.lock().await;
             let session = match s.sessions.get_mut(&session_id) {
                 Some(s) => s,
@@ -711,7 +633,7 @@ async fn handle_send(
                 resp.lost_bytes = Some(lost_bytes);
             }
 
-            if let Some(code) = exit_code {
+            if let Some(code) = check.exit_code {
                 resp.exited = Some(true);
                 resp.exit_code = Some(code);
             }
